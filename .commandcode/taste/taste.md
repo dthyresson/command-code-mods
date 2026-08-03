@@ -9,3 +9,9 @@
 - Uses underscore as thousands separator in numeric literals (e.g., `3_000` instead of `3000`) for readability in JavaScript/TypeScript. Confidence: 0.8
 
 - When feeding long text to an LLM (e.g., prior run output), prefers distributed sampling from start, middle, and end over naive head truncation — gives the model representative coverage of the full content. Confidence: 0.7
+
+- Prefers minimal code — strips unused machinery (e.g., custom renderers) and simplifies logic to its smallest correct form, such as a plain presence check (`if (haiku)`) instead of splitting/filtering/slicing text when the extra parsing isn't needed. Confidence: 0.7
+
+- Prefers example/showcase code to be commented with the framework's key hooks and capabilities explained (e.g., what `addFlag`, `onStop` with `{continue: true}`, `prepareNextTurn`, and `cmd.ui.notify` demonstrate), not just what the code does mechanically. The "most important" comments are the ones that teach the API surface. Confidence: 0.8
+
+- Treats this repo's real purpose as showcasing the Command Code mod API — "more important than the mod is how it showcases command code mods." Documentation (README) should be framed around what each mod demonstrates of the API surface, not the mod's own features. Confidence: 0.9
