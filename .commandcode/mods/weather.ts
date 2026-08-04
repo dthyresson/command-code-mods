@@ -3,6 +3,10 @@
 // Flags: --mod-option city=Boston,MA --mod-option temp_unit=fahrenheit|celsius
 //        --mod-option wind_speed_unit=mph|kmh
 // Command: /weather [city] [f|m] — city + short unit shortcut (/weather Paris f)
+//
+// Showcases: cmd.ui.widget (floating panel), cmd.ui.setStatus (footer line),
+//            cmd.addFlag (CLI config), cmd.addCommand (slash commands),
+//            cmd.hooks onSessionStart/onSessionEnd (lifecycle), memoized API cache
 
 import type {ModApi} from '@commandcode/harness';
 
@@ -13,6 +17,8 @@ export default function (cmd: ModApi): void {
 	const REFRESH_INTERVAL_MS = 10 * 60 * 1000;
 
 	// ── WMO weather condition emojis ────────────────────────────────────────────
+	// Maps Open-Meteo WMO numeric codes → emoji display characters. Codes 0–99
+	// cover global conditions: clear, clouds, fog, drizzle, rain, snow, thunderstorm.
 
 	const CONDITION_EMOJI: Record<number, string> = {
 		0: '\u{1F324}\uFE0F',
@@ -47,9 +53,11 @@ export default function (cmd: ModApi): void {
 
 	type WeatherData = {temp: number; wind: number; code: number; temp_unit: string; wind_unit: string; place?: string};
 	let cache: {coords: {lat: number; lon: number}; data: WeatherData | null; ts: number} | null = null;
+	/** Memoized API cache — stores resolved coordinates, fetched data, and timestamp. Skips redundant API calls within CACHE_LIFE_MS if units haven't changed. */
 
 	// ── helpers ─────────────────────────────────────────────────────────────────
 
+	/** Convert API unit strings into human-readable display labels (e.g. °F, km/h). */
 	function apiToLabel(unit: string): string {
 		switch (unit.toLowerCase()) {
 			case 'fahrenheit': case 'f': return '\u00B0F';
@@ -62,6 +70,7 @@ export default function (cmd: ModApi): void {
 		}
 	}
 
+	/** Resolve a human-readable city name to geographic coordinates via Open-Meteo geocoding. Returns null if the city can't be found. */
 	async function geoQuery(q: string): Promise<{lat: number; lon: number} | null> {
 		const url = `${GEO_URL}?name=${encodeURIComponent(q)}&count=1`;
 		const res = await fetch(url);
@@ -71,7 +80,7 @@ export default function (cmd: ModApi): void {
 	}
 
 	// ── weather fetch ───────────────────────────────────────────────────────────
-
+	/** Fetch current weather for a city, using memoized cache when units match and data is fresh. */
 	async function fetchWeather(city: string, tempUnit: string, windUnit: string): Promise<WeatherData | null> {
 		const cached = cache;
 		if (cached && Date.now() - cached.ts < CACHE_LIFE_MS && cached.data?.temp_unit === tempUnit && cached.data?.wind_unit === windUnit) return cached.data;
@@ -99,6 +108,7 @@ export default function (cmd: ModApi): void {
 
 	// ── render ──────────────────────────────────────────────────────────────────
 
+	/** Format weather data into a single display string with emoji, city, temperature & wind. */
 	function render(w: WeatherData | null): string {
 		if (!w) return `\u{1F321}\uFE0F Weather unavailable`;
 		const emoji = Object.entries(CONDITION_EMOJI).find(([k]) => Number(k) === w.code)?.[1] ?? '';
@@ -110,9 +120,12 @@ export default function (cmd: ModApi): void {
 
 	// ── display ─────────────────────────────────────────────────────────────────
 
+	/** Persistent weather panel rendered above the editor. Disposed and recreated on each update to avoid stale panels stacking up. */
 	let widgetDisp: {dispose: () => void} | undefined = cmd.ui.widget({placement: 'above-editor', render: () => [render(cache?.data ?? null)]});
+	/** Timer ID for the periodic REFRESH_INTERVAL_MS auto-refresh of the footer status line. */
 	let intervalId: ReturnType<typeof setInterval>;
 
+	/** Fetch weather once (initial load), then start an interval timer to keep the footer status updated every REFRESH_INTERVAL_MS. */
 	function refresh(tempU: string, windU: string) {
 		fetchWeather(cmd.getFlag('city') as string, tempU, windU).then(w => {
 			const t = render(w);
@@ -134,6 +147,7 @@ export default function (cmd: ModApi): void {
 		name: 'weather',
 		description: 'Refresh weather or set units (/weather Paris f)',
 		handler: ({args}) => {
+			// Parse args accepting both short tokens (/weather Paris f) and flag-style (--temp=celsius --city="New York")
 			const rest = args.trim().split(/\s+/);
 			let oCity: string | undefined, oTemp: string | undefined, oWind: string | undefined;
 			for (const a of rest) {
@@ -146,5 +160,7 @@ export default function (cmd: ModApi): void {
 		},
 	});
 
+	// Register lifecycle hooks — auto-fetch weather on session start so the widget populates immediately,
+	// and clean up the interval, footer status, and widget on session end to avoid stale data leaking into the next session.
 	cmd.hooks({onSessionStart: () => refresh(String(cmd.getFlag('temp_unit')), String(cmd.getFlag('wind_speed_unit'))), onSessionEnd: () => { clearInterval(intervalId); cmd.ui.setStatus(null); widgetDisp?.dispose(); }});
 }

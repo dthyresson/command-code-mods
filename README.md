@@ -7,6 +7,26 @@ Each mod is a minimal, readable example of the Command Code mod API, so you
 can lift the patterns into your own mods. **hooku** is the flagship showcase:
 it touches nearly every capability a mod can use.
 
+## Project structure
+
+```
+command-code-mods/
+├── .gitignore
+├── LICENSE
+├── README.md
+└── .commandcode/
+    ├── mods/
+    │   ├── clock.ts
+    │   ├── hex-color-swatch.ts
+    │   ├── hooku.ts
+    │   ├── tamagotchi.ts
+    │   └── weather.ts
+    └── taste/
+        └── taste.md
+```
+
+Each `.ts` file under `.commandcode/mods/` is a standalone Command Code mod you can load with `cmd --mod`.
+
 ## What a mod is
 
 A mod is a TypeScript file that exports a single function receiving the
@@ -318,6 +338,114 @@ cmd mods list
 - A terminal with 24-bit ("truecolor") ANSI support (most modern terminals).
   Without it, the `██` renders as a plain colored glyph rather than a true
   color swatch.
+
+## weather
+
+Shows current weather & temperature in the TUI footer using the free
+[Open-Meteo](https://open-meteo.com) API — no API key required. Shows a
+widget panel above the editor with full details, and a compact one-liner in
+the footer status.
+
+### What it does
+
+Fetches today's temperature, wind speed, and condition code for a configured
+city, then displays both a persistent **widget** (above the editor) and a
+compact **status line** (footer). Updates live every 10 minutes and caches
+responses so repeated calls don't hit the API unnecessarily.
+
+```bash
+# Default: Boston, MA in Fahrenheit / mph
+cmd
+
+# Custom city, Celsius, km/h
+cmd --mod-option weather.city="Paris,FR" \
+    --mod-option weather.temp_unit=celsius \
+    --mod-option weather.wind_speed_unit=kmh
+```
+
+### What it demonstrates
+
+- **`cmd.ui.widget({placement, render})` — floating overlay panel.** The mod
+  registers a widget anchored `above-editor` that re-renders with each weather
+  fetch. The render function returns a single-element array so the panel shows
+  just the formatted line. Calling `.dispose()` before re-registration prevents
+  stale panels from stacking.
+- **`cmd.ui.setStatus` — compact footer presence.** A parallel one-liner like
+  `☀️ Boston — 72°F, Wind 8 mph` sits in the footer alongside other mods'
+  segments. Headless mode stores the value but renders nowhere.
+- **`cmd.addFlag` — first-class CLI options.** Three flags (`city`,
+  `temp_unit`, `wind_speed_unit`) read back at runtime via `cmd.getFlag`.
+  Each has a sensible default and validates against a small set of allowed
+  values.
+- **`cmd.addCommand` — inline slash commands.** `/weather [city] [f|m]` lets
+  you refresh weather or switch units without shell flags — e.g.
+  `/weather Paris f` sets city to Paris and temperature to Fahrenheit in one
+  invocation. The handler parses positional args and flag-style tokens alike.
+- **`hooks.onSessionStart` / `onSessionEnd` — lifecycle bookends.** Weather
+  auto-fetches when a session begins so the widget is populated immediately;
+  cleanup disposes the widget and clears the footer status on session end.
+- **Async API + memoized caching.** A `CACHE_LIFE_MS` check skips redundant
+  fetches within 10 minutes, preventing rate-limit hits during rapid
+  tool-call chains. Geocoding queries are fire-and-forget — if a city lookup
+  fails, the widget shows "Weather unavailable."
+- **WMO code → emoji mapping.** Numeric weather codes map to standardized
+  icons (☀️ clear, ⛅ partly cloudy, 🌧️ rain, ❄️ snow, ⛈️ thunderstorm),
+  keeping the output visual without pulling in emoji description text.
+
+### Install
+
+#### Project mod (trusted workspace)
+
+Copy to `.commandcode/mods/weather.ts` (this repo already has it there).
+
+#### Personal mod
+
+```bash
+mkdir -p ~/.commandcode/mods
+cp .commandcode/mods/weather.ts ~/.commandcode/mods/
+```
+
+#### As a package
+
+```bash
+cmd mods add ./path/to/this-repo
+```
+
+### Load & verify
+
+```bash
+# Load without installing
+cmd --mod ./.commandcode/mods/weather.ts
+
+# Confirm registration
+cmd mods list
+
+# Inline shortcut — no shell restart needed
+/reload
+```
+
+### How it works
+
+- **Geocoding** — `geoQuery()` resolves a city string to `{lat, lon}` via
+  Open-Meteo's geocoding API. If no results match, weather defaults to
+  "unavailable."
+- **Forecast fetch** — once per session (or every 10 min cache expiry), the
+  current weather endpoint pulls `temperature_2m`, `windspeed_10m`, and
+  `weathercode`. Temperature and wind units come from flags.
+- **Dual display** — `widget` paints above the editor with the full formatted
+  line; `setStatus` keeps the footer one-liner updated in lock step.
+- **Cleanup** — `onSessionEnd` disposes the widget, clears the interval timer,
+  and resets the footer status to avoid stale data leaking into the next
+  session.
+
+### Details
+
+- **No API key** — Open-Meteo is free and requires no authentication.
+- **Units pass-through** — temperatures and windspeed are rendered with the
+  unit label returned by the API (`°F`, `°C`, `mph`, `km/h`). No local
+  conversion logic.
+- **Graceful degradation** — network errors, bad cities, or missing fields all
+  result in a friendly `"🌡️ Weather unavailable"` message instead of a crash.
 
 ## Going further
 
