@@ -2,7 +2,7 @@
 // single function that receives the ModApi (cmd) and registers capabilities —
 // flags, hooks, and UI feedback — on it. See the README for what each
 // capability demonstrates.
-import type {ModApi} from '@commandcode/harness';
+import type { ModApi } from "@commandcode/harness";
 
 // Cap on how much run output gets fed to the haiku model.
 const MAX_OUTPUT = 3_000;
@@ -28,21 +28,21 @@ export default function (cmd: ModApi): void {
   // Flags: a mod can register its own CLI options, read back at runtime via
   // cmd.getFlag. Users set them with --mod-option <name>=<value>, e.g.
   // --mod-option hooku.enabled=false.
-  cmd.addFlag('hooku.enabled', {
-    type: 'boolean',
-    default: true,
-    description: 'Compose a haiku poem after each run ends',
+  cmd.addFlag("hooku.enabled", {
+    type: "boolean",
+    default: false,
+    description: "Compose a haiku poem after each run ends",
   });
 
-  cmd.addFlag('hooku.model', {
-    type: 'string',
-    default: 'deepseek/deepseek-v4-flash',
-    description: 'Model to use for haiku generation',
+  cmd.addFlag("hooku.model", {
+    type: "string",
+    default: "deepseek/deepseek-v4-flash",
+    description: "Model to use for haiku generation",
   });
 
   // State shared across the two turns of the haiku flow.
   let haikuPending = false;
-  let runOutput = '';
+  let runOutput = "";
 
   cmd.hooks({
     // prepareNextTurn runs before each turn and can return a model to switch
@@ -50,8 +50,10 @@ export default function (cmd: ModApi): void {
     // (cheaper) haiku model instead of the main-loop model.
     prepareNextTurn: async () => {
       if (haikuPending) {
-        const model = String(cmd.getFlag('hooku.model') ?? 'deepseek/deepseek-v4-flash');
-        return {model};
+        const model = String(
+          cmd.getFlag("hooku.model") ?? "deepseek/deepseek-v4-flash",
+        );
+        return { model };
       }
       return undefined;
     },
@@ -62,15 +64,17 @@ export default function (cmd: ModApi): void {
     // The hook fires again on that follow-up turn, so the flow is two-phase:
     //   1) first onStop  → haikuPending false → kick off the haiku turn
     //   2) second onStop → haikuPending true  → the haiku came back
-    onStop: async ({lastAssistantText}) => {
-      if (!cmd.getFlag('hooku.enabled')) return undefined;
+    onStop: async ({ lastAssistantText }) => {
+      if (!cmd.getFlag("hooku.enabled")) return undefined;
 
       if (!haikuPending) {
         // Phase 1: sample the run output and force one more turn asking the
         // haiku model to turn it into a poem.
         haikuPending = true;
-        runOutput = sampleText(lastAssistantText ?? '', MAX_OUTPUT);
-        const model = String(cmd.getFlag('hooku.model') ?? 'deepseek/deepseek-v4-flash');
+        runOutput = sampleText(lastAssistantText ?? "", MAX_OUTPUT);
+        const model = String(
+          cmd.getFlag("hooku.model") ?? "deepseek/deepseek-v4-flash",
+        );
 
         // cmd.ui.notify shows transient status to the user without touching
         // the run's own output.
@@ -85,7 +89,7 @@ export default function (cmd: ModApi): void {
       // Phase 2: the haiku arrived as the assistant's reply to our injected
       // turn. Just report the outcome.
       haikuPending = false;
-      const haiku = (lastAssistantText ?? '').trim();
+      const haiku = (lastAssistantText ?? "").trim();
 
       if (haiku) {
         cmd.ui.notify(`Done.`);

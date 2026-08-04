@@ -3,6 +3,7 @@
 - Prefers concrete, data-driven LLM prompts that include the actual source text/content rather than vague descriptions. When asking a model to transform or respond to something, pipe the real data into the prompt instead of relying on the model to guess from context. Confidence: 0.7
 
 - Prefers `cmd.ui.notify()` for transient status/loading messages (e.g., "writing hooku with <model>...") and custom renderers (`addRenderer` / `showEntry`) for final styled mod output. Notify is for progress; renderer is for the finished result. Confidence: 0.8
+- Prefers `cmd.ui.setStatus` over `cmd.ui.notify` for persistent on-screen mod messaging and status (e.g., a mascot's running commentary and mood). `setStatus` is for persistent footer presence; `notify` is for one-shot transient messages. The choice should be deliberate — don't use `notify` where `setStatus` gives the right persistence. Confidence: 0.8
 
 - Prefers minimal configuration surface — remove flags that don't earn their keep rather than keeping them "just in case." If only one behavior is needed (e.g., always scoped to the run), don't expose a flag for it. Confidence: 0.6
 
