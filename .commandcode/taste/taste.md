@@ -16,3 +16,13 @@
 - Prefers example/showcase code to be commented with the framework's key hooks and capabilities explained (e.g., what `addFlag`, `onStop` with `{continue: true}`, `prepareNextTurn`, and `cmd.ui.notify` demonstrate), not just what the code does mechanically. The "most important" comments are the ones that teach the API surface. Confidence: 0.8
 
 - Treats this repo's real purpose as showcasing the Command Code mod API — "more important than the mod is how it showcases command code mods." Documentation (README) should be framed around what each mod demonstrates of the API surface, not the mod's own features. Confidence: 0.9
+
+- Prefers thorough discovery before creating or changing configuration: glob for existing files, consult knowledge base topics, read directories, check current config values, shell-command to inspect, web-search and web-fetch for docs — exhaust available information before writing anything. Confidence: 0.7
+
+- Prefers explicit intent in configuration files, even at the cost of some redundancy. When a permission or setting is technically covered by another rule (e.g., `Edit` already covers `Write`), it's still worth including the redundant rule if it makes the intended behavior more obvious to a reader. Confidence: 0.5
+
+- Prefers namespaced flag names for Command Code mods — every flag should use a `modname.` prefix (e.g., `weather.city`, `clock.tz1`) to prevent collisions between mods. Bare flag names like `city` without a namespace prefix are a convention violation even if they happen to work. Confidence: 0.8
+
+- Prefers widget/UI element registration to happen inside lifecycle hooks (especially `onSessionStart`) rather than at module-import time. Creating widgets at module load causes them to appear before a session exists; deferring to `onSessionStart` ensures proper lifecycle alignment. Confidence: 0.7
+
+- Prefers a single `cmd.hooks()` call per mod that registers all hooks together, rather than spreading hook registrations across multiple invocations. Confidence: 0.5

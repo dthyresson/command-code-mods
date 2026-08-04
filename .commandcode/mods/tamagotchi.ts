@@ -105,12 +105,8 @@ const SHELL_TOOLS = new Set([
 // Utility helpers.
 const pick = <T>(arr: readonly T[]): T => arr[Math.floor(Math.random() * arr.length)]!;
 
-// Local-time hour (0–23), ignoring timezone quirks.
-const getLocalHour = (): number => {
-	const d = new Date();
-	let h = d.getHours() + (d.getTimezoneOffset() / 60);
-	return ((h % 24) + 24) % 24;
-};
+// Local-time hour (0–23).
+const getLocalHour = (): number => new Date().getHours();
 
 // Classify toolName into a category.
 const classify = (toolName: string): ToolCat => {
@@ -282,10 +278,8 @@ export default function (cmd: ModApi): void {
 				const tid = `${cat}-${turnStartTime}`;
 				if (dur > SLOW_TURN_MS && !reportedSlowTurns.has(tid)) {
 					reportedSlowTurns.add(tid);
-					if (!shouldReport('slow')) {
-						say('⏳', `took ${Math.round(dur / 1_000)}s — the model thinks hard!`);
-						prevStateKey = 'slow';
-					}
+					say('⏳', `took ${Math.round(dur / 1_000)}s — the model thinks hard!`);
+					prevStateKey = 'slow';
 				}
 				turnStartTime = 0; // Consume the timer.
 			}
@@ -293,10 +287,10 @@ export default function (cmd: ModApi): void {
 			// Track session fatigue.
 			const elapsed = now() - sessionStart;
 			if (elapsed > SESSION_FATIGUE_MS && elapsed - lastFatigueAtMs > FATIGUE_INCREMENT_MS) {
+				const secs = Math.floor((elapsed - lastFatigueAtMs) / 1_000);
 				lastFatigueAtMs = elapsed;
 				sessionFatigue += FATIGUE_INCREMENT_MS;
-				const secs = Math.floor((elapsed - lastFatigueAtMs) / 1_000);
-				say('😫', `session’s been going ${Math.round(secs / 60)}m straight — need a water break?`);
+				say(‘😫’, `session’s been going ${Math.round(secs / 60)}m straight — need a water break?`);
 				prevStateKey = `fatigue-${Math.floor(sessionFatigue / FATIGUE_INCREMENT_MS)}`;
 			}
 
@@ -308,7 +302,7 @@ export default function (cmd: ModApi): void {
 			}
 
 			// Normal tool completion with possible sleepy override.
-			const text = typeof result === 'string' ? result : JSON.stringify(result ?? '');
+			const text = typeof result === 'string' ? result : '';
 			const {emoji: e, msg: m} = decideAfter(cat, !!isError, text, !!sleepy, sleepy);
 			say(e, m);
 		},

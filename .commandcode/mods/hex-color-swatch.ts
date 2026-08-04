@@ -95,18 +95,15 @@ function colorLine(colors: string[]): string {
 }
 
 export default function (cmd: ModApi): void {
-  // 1. Annotate typed hex input inline before the model sees it.
   cmd.hooks({
+    // Annotate typed hex input inline before the model sees it.
     transformInput: ({ text }) => {
       if (!HAS_HEX.test(text)) return { action: "continue" };
       return { action: "transform", text: annotate(text) };
     },
-  });
 
-  // 2. When the model output contains hex colors, show a color list feed row.
-  //    The response itself is NOT rewritten or echoed back — the original
-  //    text stays as-is; we just append a compact list of the colors found.
-  cmd.hooks({
+    // When the model output contains hex colors, show a color list feed row.
+    // The response itself is NOT rewritten — the original text stays as-is.
     onStop: ({ lastAssistantText }) => {
       if (
         typeof lastAssistantText !== "string" ||

@@ -185,8 +185,7 @@ export default function(cmd: ModApi): void {
 
 	// Return all extra timezone entries. Reads each flag and applies defaults.
 	function extraLines(now: Date): Array<{label: string; time: string; emoji: string}> {
-		const fmt24 = !cmd.getFlag('clock.format') || cmd.getFlag('clock.format') === '24';
-		const extras: Array<{label: string; time: string; emoji: string}> = [];
+	const extras: Array<{label: string; time: string; emoji: string}> = [];
 
 		// Resolve effective values: custom override or built-in default.
 		const slots = [
@@ -205,7 +204,7 @@ export default function(cmd: ModApi): void {
 				})();
 				extras.push({
 					label: tzLabel(slots[i], now),
-					time:  formatInZone(now, slots[i], fmt24),
+					time:  formatInZone(now, slots[i], lastFormat24),
 					emoji: getEmojiForHour(h),
 				});
 			} catch { /* Ignore invalid timezone strings silently */ }
@@ -227,8 +226,9 @@ export default function(cmd: ModApi): void {
 	function refreshClock(): void {
 		lastFormat24 = !cmd.getFlag('clock.format') || cmd.getFlag('clock.format') === '24';
 		const fmt = lastFormat24 ? '24 h' : '12 h';
-		cmd.ui.setStatus(fullDisplay(new Date())
-			? `⏰ Clock (${fmt})\n${fullDisplay(new Date())}`
+		const display = fullDisplay(new Date());
+		cmd.ui.setStatus(display
+			? `⏰ Clock (${fmt})\n${display}`
 			: `⏰ Clock (${fmt})`);
 	}
 

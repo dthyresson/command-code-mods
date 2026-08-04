@@ -120,28 +120,28 @@ export default function (cmd: ModApi): void {
 
 	// ── display ─────────────────────────────────────────────────────────────────
 
-	/** Persistent weather panel rendered above the editor. Disposed and recreated on each update to avoid stale panels stacking up. */
-	let widgetDisp: {dispose: () => void} | undefined = cmd.ui.widget({placement: 'above-editor', render: () => [render(cache?.data ?? null)]});
+	/** Weather widget created in onSessionStart, disposed and recreated on each update to avoid stale panels stacking up. */
+	let widgetDisp: {dispose: () => void} | undefined;
 	/** Timer ID for the periodic REFRESH_INTERVAL_MS auto-refresh of the footer status line. */
 	let intervalId: ReturnType<typeof setInterval>;
 
 	/** Fetch weather once (initial load), then start an interval timer to keep the footer status updated every REFRESH_INTERVAL_MS. */
 	function refresh(tempU: string, windU: string) {
-		fetchWeather(cmd.getFlag('city') as string, tempU, windU).then(w => {
+		fetchWeather(cmd.getFlag('weather.city') as string, tempU, windU).then(w => {
 			const t = render(w);
 			cmd.ui.setStatus(t || `\u{1F321}\uFE0F Error fetching weather`);
 			widgetDisp?.dispose();
 			widgetDisp = cmd.ui.widget({placement: 'above-editor', render: () => [t]});
 			clearInterval(intervalId);
-			intervalId = setInterval(() => { fetchWeather(cmd.getFlag('city') as string, tempU, windU).then(x => cmd.ui.setStatus(render(x))); }, REFRESH_INTERVAL_MS);
+			intervalId = setInterval(() => { fetchWeather(cmd.getFlag('weather.city') as string, tempU, windU).then(x => cmd.ui.setStatus(render(x))); }, REFRESH_INTERVAL_MS);
 		});
 	}
 
 	// ── registration ────────────────────────────────────────────────────────────
 
-	cmd.addFlag('city', {type: 'string', default: 'Boston, MA', description: 'City name for weather lookups.'});
-	cmd.addFlag('temp_unit', {type: 'string', default: 'fahrenheit', description: 'Temperature unit: fahrenheit or celsius.'});
-	cmd.addFlag('wind_speed_unit', {type: 'string', default: 'mph', description: 'Wind speed unit: mph or kmh.'});
+	cmd.addFlag('weather.city', {type: 'string', default: 'Boston, MA', description: 'City name for weather lookups.'});
+	cmd.addFlag('weather.temp_unit', {type: 'string', default: 'fahrenheit', description: 'Temperature unit: fahrenheit or celsius.'});
+	cmd.addFlag('weather.wind_speed_unit', {type: 'string', default: 'mph', description: 'Wind speed unit: mph or kmh.'});
 
 	cmd.addCommand({
 		name: 'weather',
@@ -154,13 +154,13 @@ export default function (cmd: ModApi): void {
 				if (a.startsWith('--')) { const v = a.slice(2); if (v.startsWith('temp=')) oTemp = v.split('=')[1]; else if (v.startsWith('wind=')) oWind = v.split('=')[1]; else if (v.startsWith('city=')) oCity = v.split('=')[1]; }
 				else if (!oCity) oCity = a; else if (!oTemp && /^[fcFC]$/.test(a)) oTemp = a.toLowerCase(); else if (!oWind && /^[mkMK]$/.test(a)) oWind = a.toLowerCase();
 			}
-			const tempU = oTemp || String(cmd.getFlag('temp_unit'));
-			const windU = oWind || String(cmd.getFlag('wind_speed_unit'));
+			const tempU = oTemp || String(cmd.getFlag('weather.temp_unit'));
+			const windU = oWind || String(cmd.getFlag('weather.wind_speed_unit'));
 			refresh(tempU, windU);
 		},
 	});
 
 	// Register lifecycle hooks — auto-fetch weather on session start so the widget populates immediately,
 	// and clean up the interval, footer status, and widget on session end to avoid stale data leaking into the next session.
-	cmd.hooks({onSessionStart: () => refresh(String(cmd.getFlag('temp_unit')), String(cmd.getFlag('wind_speed_unit'))), onSessionEnd: () => { clearInterval(intervalId); cmd.ui.setStatus(null); widgetDisp?.dispose(); }});
+	cmd.hooks({onSessionStart: () => refresh(String(cmd.getFlag('weather.temp_unit')), String(cmd.getFlag('weather.wind_speed_unit'))), onSessionEnd: () => { clearInterval(intervalId); cmd.ui.setStatus(null); widgetDisp?.dispose(); }});
 }

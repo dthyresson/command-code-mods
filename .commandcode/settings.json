@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Edit(/.commandcode/mods/**)",
+      "Write(/.commandcode/mods/**)",
+      "Read(/.commandcode/mods/**)"
+    ]
+  }
+}

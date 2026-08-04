@@ -63,15 +63,12 @@ therefore essential.
 
 ### Flags
 
-- `hooku.enabled` (boolean, default `true`) — toggle haiku generation.
+- `hooku.enabled` (boolean, default `false`) — toggle haiku generation.
 - `hooku.model` (string, default `deepseek/deepseek-v4-flash`) — LLM model for haiku generation.
 
 ```bash
-# Default: enabled, deepseek/deepseek-v4-flash
-cmd
-
-# Disable the haiku
-cmd --mod-option hooku.enabled=false
+# Default: disabled, use --mod-option to enable
+cmd --mod-option hooku.enabled=true
 
 # Use a different model
 cmd --mod-option hooku.model=claude-haiku-4-5-20251001
