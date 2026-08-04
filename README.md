@@ -96,6 +96,14 @@ cmd
 # Name your pet and pick its idle face
 cmd --mod-option tamagotchi.name=Mochi --mod-option tamagotchi.emoji=🐱
 ```
+<img width="764" height="162" alt="Screenshot 2026-08-04 at 11 08 12" src="https://github.com/user-attachments/assets/2b319ecc-6ac2-40bf-9965-8d11357b4745" />
+
+<img width="374" height="77" alt="Screenshot 2026-08-04 at 11 08 39" src="https://github.com/user-attachments/assets/f3d0b9f1-2dc4-4524-9d2a-001a66814bd8" />
+<img width="177" height="110" alt="Screenshot 2026-08-04 at 11 09 16" src="https://github.com/user-attachments/assets/92202b4e-439a-4390-86b0-18c54fe6bc0d" />
+
+<img width="277" height="112" alt="Screenshot 2026-08-04 at 11 09 21" src="https://github.com/user-attachments/assets/58211687-1613-49e4-84ca-4db9d30a5267" />
+<img width="288" height="121" alt="Screenshot 2026-08-04 at 11 09 29" src="https://github.com/user-attachments/assets/f1d69000-8ec7-4734-acd1-a5e0582cdf6b" />
+
 
 ## clock
 
@@ -162,6 +170,9 @@ cmd --mod-option clock.tz2=Asia/Tokyo --mod-option clock.format=12
 # Disable a slot by passing an empty value
 cmd --mod-option clock.tz3=""   # removes Sydney
 ```
+
+<img width="764" height="162" alt="Screenshot 2026-08-04 at 11 08 12" src="https://github.com/user-attachments/assets/c35b443a-09d0-4bc7-b320-8da67c636d9e" />
+
 
 ## hex-color-swatch (#fefefe → ██)
 
@@ -232,7 +243,7 @@ Ask for colors in any way and the mod renders a swatch list from the reply:
 > What's the hex for bright green?
 > List 10 material design colors
 
-### Shwocase
+### Showcase
 
 #### Seattle Kraken Colors
 
