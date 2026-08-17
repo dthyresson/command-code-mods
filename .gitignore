@@ -24,3 +24,9 @@ Icon?
 Network Trash Folder
 Temporary Items
 .apdisk
+
+# Project Brain generated knowledge store
+.commandcode/project-brain.jsonl
+
+# Task Journal episodic memory store
+.commandcode/task-journal.jsonl

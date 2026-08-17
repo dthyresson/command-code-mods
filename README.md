@@ -19,7 +19,9 @@ command-code-mods/
     │   ├── clock.ts
     │   ├── hex-color-swatch.ts
     │   ├── hooku.ts
+    │   ├── project-brain.ts
     │   ├── tamagotchi.ts
+    │   ├── task-journal.ts
     │   └── weather.ts
     └── taste/
         └── taste.md
@@ -336,6 +338,215 @@ cmd mods list
   Without it, the `██` renders as a plain colored glyph rather than a true
   color swatch.
 
+## project-brain
+
+A durable project memory: "What is true about this codebase?" It
+complements `AGENTS.md` — hand-written, static guidance stays there, while
+Project Brain *learns* durable facts from what the agent actually does:
+architecture locations, conventions, deprecations, invariants. Facts are
+stored as JSON lines in `.commandcode/project-brain.jsonl` (gitignored,
+created on first write) and injected into the system prompt on the turns
+where they matter.
+
+Because code is the source of truth, every fact records the files it came
+from. Each supporting file is content-hashed (sha256); at session start the
+brain re-hashes them and any fact whose code changed is retired as *stale*
+— memories don't outlive the code they describe.
+
+### What it demonstrates
+
+- **`appendSystemPrompt` — turn-scoped context injection.** The heart of
+  the mod. Each round, the current prompt is scored against every fact
+  (keyword / fact-text / source-path overlap) and only relevant facts are
+  appended to the system prompt. Unrelated facts stay out. The block is
+  cached by store version + prompt text, so it stays byte-stable across
+  the rounds of one run — the provider's prompt-prefix cache isn't busted.
+- **`onStop` with `{continue: true}` — a post-run discovery pass.** When a
+  run that touched the repo would end, the brain injects one extra turn
+  asking the model to propose durable facts as JSON — the same force-
+  continue mechanism hooku uses for haikus, put to real work. The reply is
+  parsed, verified (cited files must exist), deduplicated, and stored.
+- **`prepareNextTurn` — model switching.** The injected discovery turn is
+  routed to a cheap model (`deepseek/deepseek-v4-flash` by default),
+  keeping the main-loop model on real work.
+- **`transformInput` — typed-input interception.** The brain *reads* the
+  user's prompt (passing it through unchanged) so fact relevance can be
+  scored per turn.
+- **`afterToolCall` — activity tracking.** Records which files the run
+  read or edited, and which inspect commands ran, so the discovery prompt
+  knows exactly what to focus on.
+- **`onSessionStart` / `onSessionEnd` — lifecycle bookends.** Each session
+  re-validates every fact against its source files (changed or deleted
+  file ⇒ stale) and re-renders the footer count; the footer is cleared on
+  shutdown.
+- **`cmd.ui.notify` / `cmd.ui.setStatus` — 🧠 presence.** A notify with the
+  🧠 emoji announces each newly stored fact; a persistent footer segment
+  shows the active/stale fact count.
+- **`addFlag` — mod-defined configuration.** `project-brain.discover` and
+  `project-brain.model` are first-class CLI options.
+- **`addCommand` — `/brain`.** Lists knowledge, queues a discovery pass,
+  or forgets a fact by id.
+- **`addTool` — `project_brain_list`.** A read-only tool the model itself
+  can call mid-task to look up what the brain knows.
+- **Zero-dependency storage + invalidation.** A hand-rolled JSONL store
+  with content hashing via `node:crypto` — no external packages.
+
+### Flags
+
+- `project-brain.discover` (boolean, default `true`) — run a discovery
+  pass after runs that touched the repo.
+- `project-brain.model` (string, default `deepseek/deepseek-v4-flash`) —
+  cheap model used for the discovery pass.
+
+```bash
+# Defaults: discovery on, deepseek flash for the pass
+cmd
+
+# Turn discovery off (injection and /brain still work)
+cmd --mod-option project-brain.discover=false
+```
+
+### Commands
+
+- `/brain` — list every stored fact with evidence, source files,
+  confidence, status, and id.
+- `/brain learn` — queue a discovery pass for the current run.
+- `/brain forget <id>` — delete a specific fact (ids are shown by
+  `/brain`).
+
+### How it works
+
+1. **Learn.** A run ends after touching the repo (or `/brain learn`, or
+   the session's first run) → `onStop` injects one discovery turn on the
+   cheap model. The model inspects real files and replies with a JSON
+   array of proposed facts; each is verified (cited files must exist),
+   hashed, deduplicated, and appended to `.commandcode/project-brain.jsonl`
+   with a 🧠 notify.
+2. **Inject.** Next turn, `appendSystemPrompt` scores the current prompt
+   against every active fact and injects only the relevant ones, e.g.
+   "Auth middleware lives in `packages/auth`, not individual services."
+3. **Invalidate.** Session start re-hashes each fact's source files. A
+   changed or deleted file flips the fact to *stale* — it leaves the
+   system prompt and shows up in `/brain` as ⚠️, so the model never
+   blindly trusts memory the code has outgrown.
+
+### Requirements
+
+- Discovery uses the same provider as your main session model, so no
+  extra API keys are needed. It runs as an automated turn, so it works in
+  headless mode too (with the same deterministic dialog defaults).
+
+## task-journal
+
+Cross-session episodic memory: "What happened before?" Session history
+and compaction tell you what *this* session did; Task Journal remembers
+what *past* sessions did. After a *meaningful* run — one that changed
+files or ran tests, not mere read-only exploration — it saves a
+compressed episode — task, outcome, approaches tried, failures, solution,
+tests, lesson — as JSON lines in `.commandcode/task-journal.jsonl`
+(gitignored, created on first write). At the start of the next similar task it
+retrieves the top few episodes and injects them into the system prompt,
+so a future agent can answer "have we solved something resembling this
+before?" and skip straight to the solution.
+
+It deliberately does not replace session history. History is the full
+record; the journal is the semantic index over it — the compressed
+episode, not the transcript.
+
+### What it demonstrates
+
+- **`onStop` with `{continue: true}` — a post-run extraction pass.** When
+  a run that changed files would end, the journal injects one extra turn
+  asking the model to compress what just happened into a JSON episode.
+  The reply is parsed, validated, and appended to the store with a 📓
+  notify. This is the same force-continue seam hooku uses for haikus,
+  here building durable episodic memory.
+- **`prepareNextTurn` — model switching.** The injected extraction turn
+  is routed to a cheap model (`deepseek/deepseek-v4-flash` by default),
+  keeping the main-loop model on real work.
+- **`appendSystemPrompt` — the retrieval half of the loop.** Prior
+  episodes scored as relevant to the current task (keyword / task-text /
+  path overlap) are injected as "Relevant previous experience" — with
+  the reminder that it is *historical, not current truth*. Old episodes
+  are discounted; episodes that proved useful before rank higher. The
+  block is cached by store version + task text so it stays byte-stable
+  across the rounds of one run.
+- **`transformInput` — typed-input interception.** The journal *reads*
+  the user's prompt (passing it through unchanged) to know the current
+  task and to detect when a new task starts.
+- **`afterToolCall` — activity + outcome tracking.** Records which files
+  the run read or edited and which test commands ran (with verdicts) so
+  the extraction prompt knows what to focus on — and sniffs the run's
+  own green test output to feed the retrieval success signal.
+- **`cmd.addTool` — three tools.** `task_journal_search` (the model can
+  look up prior experience mid-task), `task_journal_feedback` (record
+  whether surfaced episodes helped — the training signal for a future
+  learned memory router), and `task_journal_list` (read-only index).
+- **`cmd.addCommand` — `/journal`.** Lists episodes, shows one in
+  detail, searches, or forgets an episode by id.
+- **`cmd.ui.notify` / `cmd.ui.setStatus` — 📓 presence.** A notify
+  announces each newly stored episode ("📓 Journaled: …"); a persistent
+  footer segment shows the episode count.
+- **`cmd.events` — cross-mod cooperation.** When an episode reveals a
+  durable repo fact (its lesson), the journal emits a
+  `task-journal:durable-fact` event on the mod bus. project-brain listens
+  and queues its discovery pass, so facts graduate into Project Brain —
+  the journal holds episodes, the brain holds facts. The two mods
+  cooperate without importing each other.
+- **Zero-dependency JSONL storage.** Append-only, human-inspectable, no
+  external packages.
+
+### Flags
+
+- `task-journal.extract` (boolean, default `true`) — run an episode
+  extraction pass after runs that changed files.
+- `task-journal.model` (string, default `deepseek/deepseek-v4-flash`) —
+  cheap model used for the extraction pass.
+
+```bash
+# Defaults: extraction on, deepseek flash for the pass
+cmd
+
+# Turn extraction off (retrieval, /journal, and the tools still work)
+cmd --mod-option task-journal.extract=false
+```
+
+### Commands
+
+- `/journal` — list every stored episode with outcome, date, and id.
+- `/journal show <id>` — full detail: approaches, solution, tests, lesson.
+- `/journal search <query>` — rank episodes against a task description.
+- `/journal forget <id>` — delete a specific episode.
+
+### How it works
+
+1. **Extract.** A run ends after changing files (or changing code and
+   running tests) → `onStop` injects one extraction turn on the cheap
+   model. The model replies with a JSON episode; it's validated and
+   appended to `.commandcode/task-journal.jsonl` with a 📓 notify. A run
+   counts as meaningful only if it changed at least 2 files, or changed 1
+   file and ran a test/check command — so read-only exploration (pure
+   `read_file`/`glob`/`ls`) never triggers an extraction.
+2. **Retrieve.** Next task, `appendSystemPrompt` scores the current
+   prompt against every episode and injects only the top 2–4 as
+   "Relevant previous experience" — what was tried, what failed and why,
+   what worked, how it was verified, and the lesson.
+3. **Measure.** Every retrieved episode's `retrievalCount` is bumped when
+   surfaced; when the run's own test output turns green (or the model
+   calls `task_journal_feedback`), `successfulRetrievalCount` bumps too.
+   Episodes that helped rank higher next time — the raw training data
+   for a future learned retrieval policy.
+4. **Graduate.** If an episode's lesson is a durable repo fact, the
+   journal emits a `task-journal:durable-fact` event; project-brain
+   picks it up and queues its discovery pass so the fact lives on in
+   the brain even after the episode goes stale.
+
+### Requirements
+
+- Extraction uses the same provider as your main session model, so no
+  extra API keys are needed. It runs as an automated turn, so it works
+  in headless mode too.
+
 ## weather
 
 Shows current weather & temperature in the TUI footer using the free
@@ -448,6 +659,11 @@ cmd mods list
 
 hooku covers the core mutating surface; tamagotchi covers the tool-hook +
 UI-status surface (`beforeToolCall`/`afterToolCall`, the lifecycle hooks, and
-`cmd.ui.setStatus`). Mods can do more still: register slash commands,
-intercept input, add custom renderers, and register entire model providers.
-New mods in this repo should each showcase one of those capabilities.
+`cmd.ui.setStatus`); project-brain covers `appendSystemPrompt` context
+injection and the `onStop` continuation seam put to real work (durable
+learning); task-journal pairs that same continuation seam with the retrieval
+half (`appendSystemPrompt` + `afterToolCall` feedback) to build cross-session
+episodic memory, and shows two mods cooperating over `cmd.events`. Mods can
+do more still: register slash commands, intercept input, add custom
+renderers, and register entire model providers. New mods in this repo should
+each showcase one of those capabilities.
