@@ -5,7 +5,7 @@
 // actually does, runs a short "discovery pass" when a run ends, and stores
 // durable facts — auth middleware lives in packages/auth, FooClient is
 // deprecated, migrations must regenerate the schema — as JSON lines in
-// .commandcode/project-brain.jsonl (gitignored, created on first write).
+// .commandcode/project-brain.jsonl (tracked in git, created on first write).
 //
 // On every turn it injects ONLY the facts relevant to the current prompt
 // into the system prompt (appendSystemPrompt), so the model starts each task
@@ -63,6 +63,7 @@ import type {ModApi} from '@commandcode/harness';
 import {createHash} from 'node:crypto';
 import {appendFile, mkdir, readFile, writeFile} from 'node:fs/promises';
 import {dirname, isAbsolute, join, relative, resolve, sep} from 'node:path';
+import {bold, cyan, dim, green, red, yellow} from './colors';
 
 // ── Limits ──────────────────────────────────────────────────────────────
 
@@ -305,7 +306,7 @@ export default function (cmd: ModApi): void {
 			if (!fact || isDuplicate(fact.fact)) continue;
 			await appendFact(fact);
 			stored++;
-			cmd.ui.notify(`🧠 ${truncate(fact.fact, 140)}`);
+			cmd.ui.notify(`${green('✔')} ${dim('brain')} ${bold('Learned')}: ${truncate(fact.fact, 140)}`);
 		}
 		if (stored) updateStatus();
 	}
@@ -414,6 +415,7 @@ export default function (cmd: ModApi): void {
 			'- keywords: 2-6 short terms a future prompt would use when this fact matters.\n' +
 			'- confidence: 0.0-1.0 — how sure you are.\n\n' +
 			`${scope}${cmdNote}\n\n` +
+			'Reply with ONLY one line of JSON — no prose, no markdown fences, no code block. ' +
 			'If nothing is worth remembering, reply with exactly [].'
 		);
 	}
@@ -424,8 +426,8 @@ export default function (cmd: ModApi): void {
 		const active = storeFacts.filter(f => f.status === 'active').length;
 		const stale = storeFacts.length - active;
 		cmd.ui.setStatus(
-			`🧠 ${active} fact${active === 1 ? '' : 's'}` +
-			(stale ? ` (${stale} stale)` : ''),
+			`${green('🧠')} ${active} fact${active === 1 ? '' : 's'}` +
+			(stale ? ` ${yellow(`(${stale} stale)`)}` : ''),
 		);
 	}
 
@@ -553,11 +555,12 @@ export default function (cmd: ModApi): void {
 			}
 			if (!discoverEnabled()) return {continue: false};
 			const shouldLearn =
-				forceLearn || repoFilesSeen.size > 0 || !everLearnedThisSession;
+				forceLearn || (repoFilesSeen.size > 0 && !everLearnedThisSession);
 			if (!shouldLearn) return {continue: false};
 			forceLearn = false;
 			everLearnedThisSession = true;
 			learningPending = true;
+			cmd.ui.notify(`${dim('brain')} ${bold(cyan('Discovering facts'))} with ${learnModel()}...`);
 			return {continue: true, reason: discoveryPrompt()};
 		},
 
@@ -613,7 +616,7 @@ export default function (cmd: ModApi): void {
 	cmd.events.on('task-journal:durable-fact', () => {
 		if (!discoverEnabled()) return;
 		forceLearn = true;
-		cmd.ui.notify('🧠 Journal lesson queued for Project Brain discovery.');
+		cmd.ui.notify(`${cyan('↻')} ${dim('brain')} ${bold('Journal lesson queued')} for discovery.`);
 	});
 
 	// ── Tool: project_brain_list ───────────────────────────────────────

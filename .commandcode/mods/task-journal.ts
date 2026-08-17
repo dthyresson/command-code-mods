@@ -70,6 +70,7 @@
 import type {ModApi} from '@commandcode/harness';
 import {appendFile, mkdir, readFile, writeFile} from 'node:fs/promises';
 import {dirname, join} from 'node:path';
+import {bold, cyan, dim, green, red, yellow} from './colors';
 
 // ── Limits ──────────────────────────────────────────────────────────────
 
@@ -345,7 +346,8 @@ export default function (cmd: ModApi): void {
 			'Do NOT preserve every command, every file read, temporary hypotheses, or chatter. ' +
 			'Prefer experience over transcript.\n\n' +
 			`This run:\n${scope}\n\n` +
-			'Reply with ONLY the JSON object, no other text, no markdown fences:\n' +
+			'Reply with ONLY one line of JSON — no prose, no markdown fences, no code block. ' +
+			'Keep every string field short (task/summary/lesson one sentence each, approaches ≤ 4):\n' +
 			'{"task":"...","summary":"...","outcome":"...","filesChanged":["..."],"filesRead":["..."],"approaches":[{"description":"...","result":"..."}],"solution":"...","tests":[{"command":"...","result":"..."}],"lesson":"..."}'
 		);
 	}
@@ -432,13 +434,34 @@ export default function (cmd: ModApi): void {
 		};
 	}
 
-	async function ingestExtractionOutput(text: string): Promise<void> {
+	async function ingestExtractionOutput(text: string): Promise<boolean> {
 		const raw = parseEpisodeJson(text);
-		if (!raw) return;
+		if (!raw) {
+			console.error(
+				`[task-journal] extraction output unparseable — no episode written. ` +
+				`Reply was ${text?.length ?? 0} chars.`
+			);
+			cmd.ui.notify(`${red('✖')} ${dim('journal')} ${bold('Extraction output unparseable')} — episode dropped.`);
+			return false;
+		}
 		const episode = await normalizeEpisode(raw);
-		if (!episode) return;
-		await appendEpisode(episode);
-		cmd.ui.notify(`📓 Journaled: ${truncate(episode.task, 100)}`);
+		if (!episode) {
+			console.error(
+				`[task-journal] extraction output failed validation — no episode written. ` +
+				`task=${JSON.stringify(raw.task)} outcome=${JSON.stringify(raw.outcome)}.`
+			);
+			cmd.ui.notify(`${yellow('⚠')} ${dim('journal')} ${bold('Extraction output invalid')} — episode dropped.`);
+			return false;
+		}
+		try {
+			await appendEpisode(episode);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.error(`[task-journal] write to task-journal.jsonl failed: ${msg}`);
+			cmd.ui.notify(`${red('✖')} ${dim('journal')} ${bold('Write failed')}: ${truncate(msg, 60)}`);
+			return false;
+		}
+		cmd.ui.notify(`${green('✔')} ${dim('journal')} ${bold(cyan('Journaled'))}: ${truncate(episode.task, 100)}`);
 		updateStatus();
 		// If the episode reveals a durable repo fact, hand it to
 		// project-brain (if loaded) — facts graduate out of the journal.
@@ -451,6 +474,7 @@ export default function (cmd: ModApi): void {
 				confidence: episode.outcome === 'success' ? 0.8 : 0.5,
 			});
 		}
+		return true;
 	}
 
 	// ── Feedback loop ──────────────────────────────────────────────────
@@ -496,7 +520,7 @@ export default function (cmd: ModApi): void {
 
 	function updateStatus(): void {
 		const n = episodes.length;
-		cmd.ui.setStatus(`📓 ${n} episode${n === 1 ? '' : 's'}`);
+		cmd.ui.setStatus(`${cyan('📓')} ${n} episode${n === 1 ? '' : 's'}`);
 	}
 
 	function listEpisodesMessage(): string {
@@ -657,8 +681,23 @@ export default function (cmd: ModApi): void {
 		 */
 		onStop: async ({lastAssistantText}) => {
 			if (extractionPending) {
+				// Phase 2: the extraction turn finished. Ingest its reply;
+				// if it wasn't our episode (a sibling mod's continuation
+				// payload can land here), keep pending so the next stop
+				// retries with the correct text instead of dropping.
+				let ok = false;
+				try {
+					ok = await ingestExtractionOutput(lastAssistantText);
+				} catch (err) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.error(`[task-journal] extraction ingest threw: ${msg}`);
+					cmd.ui.notify(`${red('✖')} ${dim('journal')} ${bold('Extraction failed')}: ${truncate(msg, 60)}`);
+				}
+				if (!ok) {
+					cmd.ui.notify(`${dim('journal')} ${bold(cyan('Retrying extraction'))}...`);
+					return {continue: true, reason: extractionPrompt()};
+				}
 				extractionPending = false;
-				await ingestExtractionOutput(lastAssistantText);
 				return {continue: false};
 			}
 			const meaningful = filesChanged.size >= MIN_MEANINGFUL ||
@@ -669,7 +708,7 @@ export default function (cmd: ModApi): void {
 				return {continue: false};
 			}
 			extractionPending = true;
-			cmd.ui.notify(`📓 Extracting episode with ${extractionModel()}...`);
+			cmd.ui.notify(`${dim('journal')} ${bold(cyan('Extracting episode'))} with ${extractionModel()}...`);
 			return {continue: true, reason: extractionPrompt()};
 		},
 

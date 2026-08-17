@@ -3,7 +3,9 @@
     "allow": [
       "Edit(/.commandcode/mods/**)",
       "Write(/.commandcode/mods/**)",
-      "Read(/.commandcode/mods/**)"
+      "Read(/.commandcode/mods/**)",
+      "Shell(pnpm:*)",
+      "Shell(git:*)"
     ]
   }
 }

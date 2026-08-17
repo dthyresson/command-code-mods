@@ -31,7 +31,8 @@
 
 - Prefers a single `cmd.hooks()` call per mod that registers all hooks together, rather than spreading hook registrations across multiple invocations. Confidence: 0.5
 
-- Prefers storing durable knowledge/facts in a small local JSONL file (gitignored, created on first write) rather than a database or cloud service — lightweight, human-inspectable, zero external dependencies. Confidence: 0.8
+- Prefers storing durable knowledge/facts in a small local JSONL file (created on first write) rather than a database or cloud service — lightweight, human-inspectable, zero external dependencies. Confidence: 0.8
+- Wants the memory store files (.commandcode/project-brain.jsonl and task-journal.jsonl) committed to git rather than gitignored, so the history of learned facts and episodes is kept across sessions — the memory files are treated as valuable, trackable project artifacts, not throwaway local state. Confidence: 0.9
 
 - Prefers every stored fact/knowledge entry to carry provenance metadata — the fact itself plus evidence, source files/commit, timestamp, and confidence — so nothing is remembered without a verifiable basis. Confidence: 0.8
 
@@ -46,5 +47,8 @@
 - Prefers keeping episodic memory separate from durable factual knowledge: if an episode reveals a durable repository fact, that fact should graduate into a dedicated facts store (e.g., Project Brain) rather than permanently living only in the episode journal. Confidence: 0.65
 
 - Prefers instrumenting memory/retrieval systems with a usefulness feedback loop — record when a stored episode was retrieved and whether the task subsequently succeeded, as the training signal for a future learned retrieval policy. Confidence: 0.6
+- Prefers memory-mod failure paths to be observable rather than silent: unparseable extraction output, failed validation, or a store write error should each log the reason to stderr and surface a `cmd.ui.notify`, and the phase-2 ingest call should be wrapped in try/catch — no episode may vanish without a trace. Confidence: 0.7
+- Prefers backfilling memory data that a bug dropped rather than accepting the loss — e.g., manually appending an earlier extraction episode to task-journal.jsonl so the journal history is complete, rather than starting the store empty. Confidence: 0.6
+- Prefers verifying mod behavior with a real end-to-end probe run (headless `cmd -p` that actually changes a file, fires the hooks, and is inspected via the NDJSON event stream) rather than trusting code reading or static analysis. Confidence: 0.5
 
 - Prefers that retrieved historical experience be injected as non-authoritative context — labeled as historical, not current truth, and verified against the present code. It should influence exploration, never override the repository. Confidence: 0.65

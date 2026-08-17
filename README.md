@@ -14,6 +14,7 @@ command-code-mods/
 ├── .gitignore
 ├── LICENSE
 ├── README.md
+├── memory-test-app/   # small React playground for exercising the memory mods
 └── .commandcode/
     ├── mods/
     │   ├── clock.ts
@@ -344,8 +345,8 @@ A durable project memory: "What is true about this codebase?" It
 complements `AGENTS.md` — hand-written, static guidance stays there, while
 Project Brain *learns* durable facts from what the agent actually does:
 architecture locations, conventions, deprecations, invariants. Facts are
-stored as JSON lines in `.commandcode/project-brain.jsonl` (gitignored,
-created on first write) and injected into the system prompt on the turns
+stored as JSON lines in `.commandcode/project-brain.jsonl` (tracked in
+git, created on first write) and injected into the system prompt on the turns
 where they matter.
 
 Because code is the source of truth, every fact records the files it came
@@ -444,7 +445,7 @@ what *past* sessions did. After a *meaningful* run — one that changed
 files or ran tests, not mere read-only exploration — it saves a
 compressed episode — task, outcome, approaches tried, failures, solution,
 tests, lesson — as JSON lines in `.commandcode/task-journal.jsonl`
-(gitignored, created on first write). At the start of the next similar task it
+(tracked in git, created on first write). At the start of the next similar task it
 retrieves the top few episodes and injects them into the system prompt,
 so a future agent can answer "have we solved something resembling this
 before?" and skip straight to the solution.
