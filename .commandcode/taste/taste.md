@@ -77,3 +77,5 @@
 
 - Prefers holistic quality review alongside a targeted fix: when improving retrieval, also asked to "review the mods for any other improvements to quality and relevance" — wants related defects (e.g., broken feedback wiring, validation gaps, stale-data handling, state resets) found and fixed in the same pass, not just the reported issue. Confidence: 0.55
 fidence: 0.55
+
+- Prefers checking which files changed recently via the task journal rather than git — asked "what recent files changed, don't use git to check"; when the agent answered with filesystem mtime scanning (`find -mtime` piped through `ls -lt`), the user redirected to "just use journal not git". The task journal is the preferred source of truth for recently changed files; filesystem mtime scans were only a stopgap, not the desired approach. Confidence: 0.7
