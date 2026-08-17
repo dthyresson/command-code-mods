@@ -5,7 +5,9 @@
       "Write(/.commandcode/mods/**)",
       "Read(/.commandcode/mods/**)",
       "Shell(pnpm:*)",
-      "Shell(git:*)"
+      "Shell(git:*)",
+      "Shell(cmd:*)",
+      "Shell(grep:*)"
     ]
   }
 }

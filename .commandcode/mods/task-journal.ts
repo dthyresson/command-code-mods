@@ -5,10 +5,11 @@
 // PAST sessions did — the compressed episodes, not the transcripts.
 //
 // At the end of a meaningful run it saves a tiny structured episode (task,
-// outcome, approaches tried, failures, solution, tests, lesson). "Meaningful"
-// means the run changed at least 2 files, or changed 1 file and ran a
-// test/check command — read-only exploration (pure read_file/glob/ls) never
-// triggers an episode. At the start of the next task it retrieves the top few
+// outcome, approaches tried, decisions made, failures, solution, tests,
+// lesson). "Meaningful" means the run changed at least 2 files, or changed 1
+// file and ran a test/check command — read-only exploration (pure
+// read_file/glob/ls) never triggers an episode. At the start of the next task
+// it retrieves the top few
 // similar episodes and injects them into the system prompt, so a future agent
 // can answer "have we solved something resembling this before?" — and find
 // the solution in one step instead of re-deriving it.
@@ -21,9 +22,9 @@
 // - `onStop` with `{continue: true}` — a post-run episode extraction pass.
 //   When a run that touched the repo would end, the mod injects one extra
 //   turn that asks the model to compress what just happened into a JSON
-//   episode (task, outcome, approaches, failures, solution, tests, lesson).
-//   The same force-continue seam hooku uses for haikus, here put to work
-//   building durable episodic memory.
+//   episode (task, outcome, approaches, decisions, failures, solution, tests,
+//   lesson). The same force-continue seam hooku uses for haikus, here put to
+//   work building durable episodic memory.
 // - `prepareNextTurn` — model switching. The injected extraction turn is
 //   routed to a cheap model (deepseek/deepseek-v4-flash by default),
 //   keeping the main-loop model on real work.
@@ -32,8 +33,7 @@
 //   injected as "Relevant previous experience" — the retrieval half of the
 //   loop. Byte-stable caching keeps the provider prompt-prefix cache warm.
 // - `transformInput` — typed-input interception. The mod reads the user's
-//   prompt (without changing it) to know what the current task is, and to
-//   know when a NEW task has started (so the retrieval block is rebuilt).
+//   prompt (without changing it) so retrieval follows the task being solved.
 // - `afterToolCall` — outcome tracking. The mod sniffs tool results for
 //   green/red test-runner output, so retrieval success can be measured
 //   without waiting for the run to end.
@@ -59,13 +59,14 @@
 //   One JSON object per line in .commandcode/task-journal.jsonl:
 //     {id, task, summary, outcome, filesRead, filesChanged,
 //      approaches: [{description, result, reason?}],
+//      decisions: [{choice, reason?, rejected?}],
 //      solution?, tests?: [{command, result}], lesson?,
 //      startedAt?, completedAt, gitStart?, gitEnd?,
 //      retrievalCount, successfulRetrievalCount}
 //
-//   Episodes are compressed by design: task + approaches + solution +
-//   verification + lesson. Not every command, not every file read, no
-//   conversational chatter. Prefer experience over transcript.
+//   Episodes are compressed by design: task + approaches + decisions +
+//   solution + verification + lesson. Not every command, not every file read,
+//   no conversational chatter. Prefer experience over transcript.
 //
 import type {ModApi} from '@commandcode/harness';
 import {appendFile, mkdir, readFile, writeFile} from 'node:fs/promises';
@@ -79,9 +80,9 @@ const MAX_PROPOSE     = 1;   // episodes the extraction pass may propose per run
 const MAX_INJECT_TEXT = 4_000; // cap on the injected retrieval block
 const MAX_TAIL        = 3_000; // run output sampled for the extraction pass
 const STALE_DAYS      = 30;  // episodes older than this are discounted
-const RETRIEVAL_SCORE = 1.5; // an episode that helped before ranks higher
 const MIN_MEANINGFUL   = 2;   // minimum files changed to auto-extract
 const MAX_RETRIEVALS  = 20;  // feedback loop cap (sanity)
+const RELATIVE_DAYS   = 3;   // list dates show "x ago" within this window, else full date
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -98,6 +99,12 @@ interface TestRun {
 	readonly result: 'passed' | 'failed';
 }
 
+interface Decision {
+	readonly choice: string;
+	readonly reason?: string;
+	readonly rejected?: string;
+}
+
 interface TaskEpisode {
 	readonly id: string;
 	readonly task: string;
@@ -106,6 +113,7 @@ interface TaskEpisode {
 	readonly filesRead: string[];
 	readonly filesChanged: string[];
 	readonly approaches: Approach[];
+	readonly decisions: Decision[];
 	readonly solution?: string;
 	readonly tests?: TestRun[];
 	readonly lesson?: string;
@@ -153,11 +161,6 @@ function tokenize(s: string): string[] {
 		.filter(t => t.length > 1 && !STOPWORDS.has(t));
 }
 
-function isRecent(iso: string, days: number): boolean {
-	const age = Date.now() - new Date(iso).getTime();
-	return !Number.isNaN(age) && age < days * 24 * 60 * 60 * 1_000;
-}
-
 // ── Mod factory ─────────────────────────────────────────────────────────
 
 export default function (cmd: ModApi): void {
@@ -175,10 +178,12 @@ export default function (cmd: ModApi): void {
 	// survive resume, and modState must stay JSON-serializable.
 	let initPromise: Promise<void> | null = null;
 	let latestUserPrompt = '';                  // current task (transformInput)
-	let currentTask = '';                       // first user prompt of the run
+	let currentTask = '';                       // retained for extraction context
 	let retrievedEpisodeIds: string[] = [];     // episodes surfaced this run
 	let extractionPending = false;              // extraction turn is injected
 	let sawSuccessSignal = false;               // a test/check passed this run
+	let injectedEpisodes: TaskEpisode[] = [];   // episodes announced via notify/showEntry
+	let announcedPromptKey: string | null = null; // only announce once per task
 	const filesRead = new Set<string>();        // files examined this run
 	const filesChanged = new Set<string>();     // files edited this run
 	const testRuns: TestRun[] = [];             // test commands + verdicts
@@ -223,31 +228,122 @@ export default function (cmd: ModApi): void {
 
 	// ── Retrieval ──────────────────────────────────────────────────────
 
-	// Score an episode against the current task: keyword / task-text /
-	// path overlap, boosted when the episode proved useful before and
-	// discounted when it's old enough that the code may have moved on.
+	const EPISODE_MIN_SCORE = 2.5;
+	const EPISODE_FIELD_WEIGHTS = {
+		task: 4, summary: 3, solution: 4, lesson: 4, changedPath: 3,
+		readPath: 2, decision: 2, approach: 1, test: 1,
+	};
+	const PHRASE_BONUS = 1.5;
+	const FEEDBACK_MIN_RETRIEVALS = 3;
+	const FEEDBACK_MAX = 0.25;
+
+	function uniqueTokens(s: string): string[] {
+		return [...new Set(tokenize(s))];
+	}
+
+	function tokenSet(s: string): Set<string> {
+		return new Set(tokenize(s));
+	}
+
+	function pathTokens(paths: string[]): Set<string> {
+		return new Set(paths.flatMap(path => {
+			const parts = path.split(/[\\/]/g);
+			return parts.flatMap(part => [part, ...part.split(/[._-]+/g)]).flatMap(tokenize);
+		}));
+	}
+
+	function episodeFields(e: TaskEpisode): Record<string, string> {
+		return {
+			task: e.task,
+			summary: e.summary,
+			solution: e.solution ?? '',
+			lesson: e.lesson ?? '',
+			changedPath: e.filesChanged.join(' '),
+			readPath: e.filesRead.join(' '),
+			decision: (e.decisions ?? []).map(d => `${d.choice} ${d.reason ?? ''} ${d.rejected ?? ''}`).join(' '),
+			approach: (e.approaches ?? []).map(a => `${a.description} ${a.reason ?? ''}`).join(' '),
+			test: (e.tests ?? []).map(t => t.command).join(' '),
+		};
+	}
+
+	function documentFrequency(items: TaskEpisode[]): Map<string, number> {
+		const frequencies = new Map<string, number>();
+		for (const e of items) {
+			const fields = episodeFields(e);
+			const tokens = new Set(Object.values(fields).flatMap(tokenize));
+			for (const token of tokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
+		}
+		return frequencies;
+	}
+
+	function rarity(token: string, total: number, frequencies: Map<string, number>): number {
+		return Math.log((total + 1) / ((frequencies.get(token) ?? 0) + 1)) + 1;
+	}
+
+	function phraseCount(query: string, fields: string[]): number {
+		const tokens = uniqueTokens(query);
+		const phrases = tokens.slice(0, -1).map((token, i) => `${token} ${tokens[i + 1]}`);
+		const normalizedFields = fields.map(normText);
+		return phrases.filter(phrase => normalizedFields.some(field => field.includes(phrase))).length;
+	}
+
+	function recencyMultiplier(iso: string): number {
+		const ageMs = Date.now() - new Date(iso).getTime();
+		if (!Number.isFinite(ageMs) || ageMs <= 0) return 1;
+		const ageDays = ageMs / (24 * 60 * 60 * 1_000);
+		return 0.5 + 0.5 / (1 + ageDays / STALE_DAYS);
+	}
+
+	function outcomeMultiplier(outcome: Outcome): number {
+		return outcome === 'success' ? 1 : outcome === 'partial' ? 0.85 : 0.7;
+	}
+
 	function scoreEpisode(e: TaskEpisode, promptText: string): number {
-		const promptTokens = tokenize(promptText);
-		if (!promptTokens.length) return 0;
-		const taskText = e.task.toLowerCase() + ' ' + e.summary.toLowerCase();
-		let hits = 0;
-		for (const t of promptTokens) {
-			if (taskText.includes(t) ||
-				e.filesChanged.some(f => f.toLowerCase().includes(t)) ||
-				e.filesRead.some(f => f.toLowerCase().includes(t))) {
-				hits++;
+		const queryTokens = uniqueTokens(promptText);
+		if (!queryTokens.length) return 0;
+		const fields = episodeFields(e);
+		const frequencies = documentFrequency(episodes);
+		let score = 0;
+		let signals = 0;
+		for (const token of queryTokens) {
+			const weight = rarity(token, episodes.length, frequencies);
+			for (const [field, text] of Object.entries(fields)) {
+				if (tokenSet(text).has(token)) {
+					score += EPISODE_FIELD_WEIGHTS[field as keyof typeof EPISODE_FIELD_WEIGHTS] * weight;
+					signals++;
+				}
 			}
 		}
-		if (hits === 0) return 0;
-		let score = 0.5 + 0.5 * Math.min(1, hits / 3);
-		if (e.retrievalCount > 0) {
-			score += RETRIEVAL_SCORE *
-				(e.successfulRetrievalCount / e.retrievalCount);
+		const pathMatch = [...pathTokens([...e.filesChanged, ...e.filesRead])]
+			.some(token => queryTokens.includes(token));
+		const phrases = phraseCount(promptText, Object.values(fields));
+		if (phrases) score += phrases * PHRASE_BONUS;
+		if (!signals || (score < EPISODE_MIN_SCORE && !pathMatch && !phrases)) return 0;
+		score *= outcomeMultiplier(e.outcome);
+		if (e.retrievalCount >= FEEDBACK_MIN_RETRIEVALS) {
+			const successRate = clamp(e.successfulRetrievalCount / e.retrievalCount, 0, 1);
+			score *= 1 + FEEDBACK_MAX * successRate;
 		}
-		if (e.completedAt && !isRecent(e.completedAt, STALE_DAYS)) {
-			score *= 0.5; // old experience — influence, don't override
+		return score * recencyMultiplier(e.completedAt);
+	}
+
+	function rankEpisodes(promptText: string, limit = MAX_INJECT): TaskEpisode[] {
+		const ranked = episodes
+			.map(e => ({e, s: scoreEpisode(e, promptText)}))
+			.filter(x => x.s > 0)
+			.sort((a, b) => b.s - a.s || b.e.completedAt.localeCompare(a.e.completedAt));
+		const selected: Array<{e: TaskEpisode; s: number}> = [];
+		for (const candidate of ranked) {
+			const candidateTokens = new Set(Object.values(episodeFields(candidate.e)).flatMap(tokenize));
+			const duplicate = selected.some(item => {
+				const existingTokens = new Set(Object.values(episodeFields(item.e)).flatMap(tokenize));
+				const shared = [...candidateTokens].filter(token => existingTokens.has(token)).length;
+				return shared / Math.max(1, Math.max(candidateTokens.size, existingTokens.size)) >= 0.8;
+			});
+			if (!duplicate) selected.push(candidate);
+			if (selected.length >= limit) break;
 		}
-		return score;
+		return selected.map(item => item.e);
 	}
 
 	function renderEpisodeForModel(e: TaskEpisode): string {
@@ -260,6 +356,14 @@ export default function (cmd: ModApi): void {
 			for (const a of e.approaches) {
 				const reason = a.reason ? ` — ${a.reason}` : '';
 				lines.push(`- ${a.description} (${a.result})${reason}`);
+			}
+		}
+		if (e.decisions?.length) {
+			lines.push('', 'Key decisions:');
+			for (const d of e.decisions) {
+				const reason = d.reason ? ` — ${d.reason}` : '';
+				const rejected = d.rejected ? ` (rejected: ${d.rejected})` : '';
+				lines.push(`- ${d.choice}${reason}${rejected}`);
 			}
 		}
 		if (e.solution) lines.push('', `What worked: ${e.solution}`);
@@ -278,22 +382,19 @@ export default function (cmd: ModApi): void {
 	}
 
 	// Build the system-prompt block for this round. Cached by
-	// (storeVersion, current task) so it is byte-stable across the rounds
+	// (storeVersion, latest prompt) so it is byte-stable across the rounds
 	// of one run — the provider's prompt-prefix cache keys off those bytes.
 	async function buildInjectedBlock(): Promise<string | undefined> {
 		await ensureInit();
-		const task = currentTask || latestUserPrompt;
+		const task = latestUserPrompt;
 		const key = `${storeVersion}:${task}`;
 		if (injectedCache?.key === key) return injectedCache.value || undefined;
 
 		let value: string | undefined;
 		if (task.trim()) {
-			const pick = episodes
-				.map(e => ({e, s: scoreEpisode(e, task)}))
-				.filter(x => x.s > 0)
-				.sort((a, b) => b.s - a.s)
-				.slice(0, MAX_INJECT)
-				.map(x => x.e);
+			const pick = rankEpisodes(task);
+			injectedEpisodes = pick;
+			retrievedEpisodeIds = pick.map(e => e.id);
 			if (pick.length) {
 				value =
 					'[Relevant previous experience — from the task journal]\n\n' +
@@ -303,9 +404,40 @@ export default function (cmd: ModApi): void {
 					value = value.slice(0, MAX_INJECT_TEXT) + '\n…';
 				}
 			}
+		} else {
+			injectedEpisodes = [];
 		}
 		injectedCache = {key, value: value ?? ''};
 		return value;
+	}
+
+	// ── Injection announcement ────────────────────────────────────────
+
+	// Key identifying the current prompt (the same key that keeps the retrieval
+	// block stable). New prompt text (or run end) re-arms the announce; a given
+	// prompt only announces once even though appendSystemPrompt fires per round.
+	function promptKey(): string {
+		return latestUserPrompt;
+	}
+
+	// Notify that episodes were injected, and show the exact list in the
+	// feed so the user sees precisely what experience is being used.
+	function announceInjection(key: string): void {
+		if (announcedPromptKey === key) return;
+		announcedPromptKey = key;
+		if (!injectedEpisodes.length) return;
+		const n = injectedEpisodes.length;
+		const lines = injectedEpisodes.map((e, i) =>
+			`${i + 1}. ${e.task}\n` +
+			`   Outcome: ${e.outcome}` +
+			(e.summary ? ` — ${e.summary}` : '') +
+			(e.lesson ? `\n   Lesson: ${e.lesson}` : '') +
+			(e.decisions?.length
+				? `\n   Decisions: ${e.decisions.map(d => d.choice).join('; ')}`
+				: '') +
+			`\n   ${e.id}`);
+		cmd.ui.notify(`${dim('journal')} ${bold(cyan(`${n} relevant episode${n === 1 ? '' : 's'} injected`))} — see feed entry for details.`);
+		cmd.showEntry('task-journal-injected', {title: 'Task Journal — relevant experience injected', lines});
 	}
 
 	// ── Episode extraction ─────────────────────────────────────────────
@@ -340,6 +472,8 @@ export default function (cmd: ModApi): void {
 			'- filesChanged / filesRead: the real paths that mattered, relative to the repo.\n' +
 			'- approaches: the materially different approaches attempted, each with\n' +
 			'  result "worked" | "failed" | "abandoned" and a one-line reason when there is one.\n' +
+			'- decisions: the key choices made this run — each with the choice, why it\n' +
+			'  was made, and the alternative that was rejected (omit if none were notable).\n' +
 			'- solution: what eventually worked (omit if nothing did).\n' +
 			'- tests: verification commands with result "passed" | "failed" (omit if none).\n' +
 			'- lesson: one sentence that could save a future agent time.\n\n' +
@@ -347,8 +481,8 @@ export default function (cmd: ModApi): void {
 			'Prefer experience over transcript.\n\n' +
 			`This run:\n${scope}\n\n` +
 			'Reply with ONLY one line of JSON — no prose, no markdown fences, no code block. ' +
-			'Keep every string field short (task/summary/lesson one sentence each, approaches ≤ 4):\n' +
-			'{"task":"...","summary":"...","outcome":"...","filesChanged":["..."],"filesRead":["..."],"approaches":[{"description":"...","result":"..."}],"solution":"...","tests":[{"command":"...","result":"..."}],"lesson":"..."}'
+			'Keep every string field short (task/summary/lesson one sentence each, approaches ≤ 4, decisions ≤ 4):\n' +
+			'{"task":"...","summary":"...","outcome":"...","filesChanged":["..."],"filesRead":["..."],"approaches":[{"description":"...","result":"..."}],"decisions":[{"choice":"...","reason":"...","rejected":"..."}],"solution":"...","tests":[{"command":"...","result":"..."}],"lesson":"..."}'
 		);
 	}
 
@@ -402,6 +536,16 @@ export default function (cmd: ModApi): void {
 			.filter(a => a.description.length > 0)
 			.slice(0, 8);
 
+		const decisions: Decision[] = (Array.isArray(raw.decisions) ? raw.decisions : [])
+			.filter((d): d is Record<string, unknown> => !!d && typeof d === 'object')
+			.map(d => ({
+				choice: asStr(d.choice)?.trim() ?? '',
+				reason: asStr(d.reason)?.trim() || undefined,
+				rejected: asStr(d.rejected)?.trim() || undefined,
+			}))
+			.filter(d => d.choice.length > 0)
+			.slice(0, 8);
+
 		const tests: TestRun[] | undefined =
 			Array.isArray(raw.tests)
 				? (raw.tests as Record<string, unknown>[])
@@ -425,6 +569,7 @@ export default function (cmd: ModApi): void {
 			filesRead,
 			filesChanged,
 			approaches,
+			decisions,
 			solution,
 			tests: tests?.length ? tests : undefined,
 			lesson,
@@ -432,6 +577,11 @@ export default function (cmd: ModApi): void {
 			retrievalCount: 0,
 			successfulRetrievalCount: 0,
 		};
+	}
+
+	function isDuplicateEpisode(candidate: TaskEpisode): boolean {
+		const key = `${normText(candidate.task)}\n${normText(candidate.summary)}`;
+		return episodes.some(e => `${normText(e.task)}\n${normText(e.summary)}` === key);
 	}
 
 	async function ingestExtractionOutput(text: string): Promise<boolean> {
@@ -453,6 +603,11 @@ export default function (cmd: ModApi): void {
 			cmd.ui.notify(`${yellow('⚠')} ${dim('journal')} ${bold('Extraction output invalid')} — episode dropped.`);
 			return false;
 		}
+		if (isDuplicateEpisode(episode)) {
+			console.error(`[task-journal] duplicate episode skipped: ${episode.task}`);
+			cmd.ui.notify(`${yellow('⚠')} ${dim('journal')} ${bold('Duplicate episode skipped')}: ${truncate(episode.task, 80)}`);
+			return true;
+		}
 		try {
 			await appendEpisode(episode);
 		} catch (err) {
@@ -463,11 +618,14 @@ export default function (cmd: ModApi): void {
 		}
 		cmd.ui.notify(`${green('✔')} ${dim('journal')} ${bold(cyan('Journaled'))}: ${truncate(episode.task, 100)}`);
 		updateStatus();
-		// If the episode reveals a durable repo fact, hand it to
-		// project-brain (if loaded) — facts graduate out of the journal.
-		if (episode.lesson) {
+		// If the episode reveals a durable repo fact (a lesson or a key
+		// decision), hand it to project-brain (if loaded) — facts graduate
+		// out of the journal.
+		if (episode.lesson || episode.decisions.length) {
 			cmd.events.emit('task-journal:durable-fact', {
-				fact: episode.lesson,
+				fact: episode.lesson
+					?? `Decision: ${episode.decisions[0].choice}` +
+						(episode.decisions[0].reason ? ` — ${episode.decisions[0].reason}` : ''),
 				sourceFiles: episode.filesChanged.length
 					? episode.filesChanged
 					: episode.filesRead,
@@ -523,6 +681,19 @@ export default function (cmd: ModApi): void {
 		cmd.ui.setStatus(`${cyan('📓')} ${n} episode${n === 1 ? '' : 's'}`);
 	}
 
+	// Relative date for list rows: "x mins ago" / "x hr ago" / "x days ago"
+	// within RELATIVE_DAYS, otherwise the full YYYY-MM-DD date.
+	function formatDate(iso: string): string {
+		const then = new Date(iso).getTime();
+		if (Number.isNaN(then)) return iso.slice(0, 10);
+		const mins = Math.round((Date.now() - then) / 60_000);
+		if (mins < 60) return `${Math.max(1, mins)} mins ago`;
+		const hrs = Math.round(mins / 60);
+		if (hrs < 24 * RELATIVE_DAYS) return `${hrs} hr${hrs === 1 ? '' : 's'} ago`;
+		const days = Math.round(hrs / 24);
+		return `${days} days ago`;
+	}
+
 	function listEpisodesMessage(): string {
 		if (!episodes.length) {
 			return '📓 No episodes yet — run a task that changes files and one will be journaled automatically.';
@@ -535,7 +706,7 @@ export default function (cmd: ModApi): void {
 				: '';
 			return `${badge} ${e.task}\n` +
 				`   ─ ${e.summary}\n` +
-				`   📎 ${e.completedAt.slice(0, 10)} · ${e.id}${files}${used}`;
+				`   📎 ${formatDate(e.completedAt)} · ${e.id}${files}${used}`;
 		});
 		return `📓 Task Journal — ${episodes.length} episode(s)\n\n${rows.join('\n\n')}`;
 	}
@@ -553,6 +724,14 @@ export default function (cmd: ModApi): void {
 			lines.push('', 'Approaches:');
 			for (const a of e.approaches) {
 				lines.push(`- ${a.description} (${a.result}${a.reason ? `: ${a.reason}` : ''})`);
+			}
+		}
+		if (e.decisions?.length) {
+			lines.push('', 'Decisions:');
+			for (const d of e.decisions) {
+				const reason = d.reason ? `: ${d.reason}` : '';
+				const rejected = d.rejected ? ` (rejected: ${d.rejected})` : '';
+				lines.push(`- ${d.choice}${reason}${rejected}`);
 			}
 		}
 		if (e.solution) lines.push('', `Solution: ${e.solution}`);
@@ -587,6 +766,7 @@ export default function (cmd: ModApi): void {
 		 */
 		onSessionStart: async () => {
 			initPromise = null;      // force a fresh load
+			announcedPromptKey = null;
 			await ensureInit();
 			updateStatus();
 		},
@@ -600,9 +780,8 @@ export default function (cmd: ModApi): void {
 		},
 
 		/**
-		 * transformInput — the mods' typed-input seam. The journal only
-		 * reads: the first prompt of a run becomes the current task (and
-		 * later prompts of the same run don't reset the retrieval block).
+		 * transformInput — the mods' typed-input seam. The journal reads
+		 * the latest prompt so retrieval follows the task currently being solved.
 		 */
 		transformInput: ({text}) => {
 			if (!currentTask) currentTask = text;
@@ -613,11 +792,15 @@ export default function (cmd: ModApi): void {
 		/**
 		 * appendSystemPrompt — the retrieval seam. Fires once per round
 		 * with the resolved base prompt; the returned block is appended
-		 * after it. Prior episodes scored as relevant to the current task
-		 * are injected here. Cached by storeVersion + task so the block
+		 * after it. Prior episodes scored as relevant to the latest prompt
+		 * are injected here. Cached by storeVersion + prompt so the block
 		 * stays byte-stable across the rounds of one run.
 		 */
-		appendSystemPrompt: async () => buildInjectedBlock(),
+		appendSystemPrompt: async () => {
+			const block = await buildInjectedBlock();
+			if (block) announceInjection(promptKey());
+			return block;
+		},
 
 		/**
 		 * afterToolCall — activity + outcome tracking. Records which files
@@ -726,10 +909,21 @@ export default function (cmd: ModApi): void {
 			filesChanged.clear();
 			testRuns.length = 0;
 			sawSuccessSignal = false;
+			announcedPromptKey = null;
+			injectedEpisodes = [];
 		},
 	});
 
 	// ── Slash command: /journal ────────────────────────────────────────
+
+	// Renderer for the injection-announcement feed entry. First registration
+	// per type wins, so this stays ours.
+	cmd.addRenderer('task-journal-injected', data => {
+		const d = data as {title?: string; lines?: string[]};
+		const lines = [...(d.lines ?? [])];
+		if (d.title) lines.unshift(dim(cyan(d.title)));
+		return lines;
+	});
 
 	cmd.addCommand({
 		name: 'journal',
@@ -772,12 +966,7 @@ export default function (cmd: ModApi): void {
 					if (!query) {
 						return {message: '📓 Usage: /journal search <query>'};
 					}
-					const ranked = episodes
-						.map(e => ({e, s: scoreEpisode(e, query)}))
-						.filter(x => x.s > 0)
-						.sort((a, b) => b.s - a.s)
-						.slice(0, MAX_INJECT)
-						.map(x => x.e);
+					const ranked = rankEpisodes(query);
 					if (!ranked.length) {
 						return {message: `📓 No episodes match "${query}".`};
 					}
@@ -802,8 +991,9 @@ export default function (cmd: ModApi): void {
 			name: 'task_journal_search',
 			description:
 				'Search the task journal for prior episodes similar to a task description. ' +
-				'Returns compressed episodes (approaches tried, failures, solution, tests, lesson) ' +
-				'from past sessions — useful when a current task resembles something solved before. ' +
+				'Returns compressed episodes (approaches tried, decisions made, failures, ' +
+				'solution, tests, lesson) from past sessions — useful when a current task ' +
+				'resembles something solved before. ' +
 				'Historical experience, not current truth: verify against the present code.',
 			input_schema: {
 				type: 'object',
@@ -822,12 +1012,11 @@ export default function (cmd: ModApi): void {
 			if (!q.trim()) {
 				return {ok: false, error: 'A query string is required.'};
 			}
-			const ranked = episodes
-				.map(e => ({e, s: scoreEpisode(e, q)}))
-				.filter(x => x.s > 0)
-				.sort((a, b) => b.s - a.s)
-				.slice(0, limit)
-				.map(x => x.e);
+			const ranked = rankEpisodes(q, limit);
+			for (const e of ranked) {
+				if (!retrievedEpisodeIds.includes(e.id)) retrievedEpisodeIds.push(e.id);
+			}
+			retrievedEpisodeIds = retrievedEpisodeIds.slice(-MAX_RETRIEVALS);
 			if (!ranked.length) {
 				return {ok: true, content: [{type: 'text', text: 'No matching episodes in the task journal.'}]};
 			}

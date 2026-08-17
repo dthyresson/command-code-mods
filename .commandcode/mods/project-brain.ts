@@ -70,6 +70,7 @@ import {bold, cyan, dim, green, red, yellow} from './colors';
 const MAX_INJECT     = 6; // relevant facts injected per turn (with a prompt)
 const GENERAL_INJECT = 3; // top-confidence facts injected before any prompt
 const MAX_PROPOSE    = 5; // facts the discovery pass may propose per run
+const RELATIVE_DAYS  = 3; // list dates show "x ago" within this window, else full date
 
 // ── Types ───────────────────────────────────────────────────────────────
 
@@ -146,6 +147,8 @@ export default function (cmd: ModApi): void {
 	let learningPending = false;               // discovery turn is injected
 	let forceLearn = false;                    // set by /brain learn
 	let everLearnedThisSession = false;
+	let injectedFacts: Fact[] = [];            // facts announced via notify/showEntry
+	let announcedPromptKey: string | null = null; // only announce once per task
 
 	// ── Store helpers ──────────────────────────────────────────────────
 
@@ -255,7 +258,8 @@ export default function (cmd: ModApi): void {
 			.map(k => k.trim())
 			.filter(Boolean)
 			.slice(0, 8);
-		const confidence = clamp(Number(raw.confidence) || 0.7, 0, 1);
+		const parsedConfidence = Number(raw.confidence);
+		const confidence = clamp(Number.isFinite(parsedConfidence) ? parsedConfidence : 0.7, 0, 1);
 
 		const rawFiles = (Array.isArray(raw.sourceFiles) ? raw.sourceFiles : [])
 			.filter((s): s is string => typeof s === 'string');
@@ -313,23 +317,86 @@ export default function (cmd: ModApi): void {
 
 	// ── Relevance scoring ──────────────────────────────────────────────
 
-	// Score a fact against the current prompt: keyword / fact-text / source-
-	// path overlap. Zero means "not relevant to this turn" and keeps the
-	// fact out of the system prompt entirely.
-	function scoreFact(f: Fact, promptText: string): number {
-		if (!promptText.trim()) return f.confidence;
-		const promptTokens = tokenize(promptText);
-		const factText = f.fact.toLowerCase();
-		const kw = new Set(f.keywords.map(k => k.toLowerCase()));
-		let hits = 0;
-		for (const t of promptTokens) {
-			if (kw.has(t) || factText.includes(t) ||
-				f.sourceFiles.some(sf => sf.path.toLowerCase().includes(t))) {
-				hits++;
-			}
+	const FACT_MIN_SCORE = 2;
+	const FACT_FIELD_WEIGHTS = {keyword: 4, path: 3, fact: 2, evidence: 1};
+	const PHRASE_BONUS = 1.5;
+
+	function uniqueTokens(s: string): string[] {
+		return [...new Set(tokenize(s))];
+	}
+
+	function tokenSet(s: string): Set<string> {
+		return new Set(tokenize(s));
+	}
+
+	function pathTokenSet(paths: string[]): Set<string> {
+		return new Set(paths.flatMap(p => {
+			const parts = p.split(/[\\/]/g);
+			return parts.flatMap(part => [part, ...part.split(/[._-]+/g)]).flatMap(tokenize);
+		}));
+	}
+
+	function documentFrequency(facts: Fact[]): Map<string, number> {
+		const frequencies = new Map<string, number>();
+		for (const f of facts) {
+			const tokens = new Set([
+				...tokenize(f.fact),
+				...tokenize(f.evidence),
+				...f.keywords.flatMap(tokenize),
+				...pathTokenSet(f.sourceFiles.map(sf => sf.path)),
+			]);
+			for (const token of tokens) frequencies.set(token, (frequencies.get(token) ?? 0) + 1);
 		}
-		if (hits === 0) return 0;
-		return f.confidence * (0.5 + 0.5 * Math.min(1, hits / 2));
+		return frequencies;
+	}
+
+	function rarity(token: string, total: number, frequencies: Map<string, number>): number {
+		return Math.log((total + 1) / ((frequencies.get(token) ?? 0) + 1)) + 1;
+	}
+
+	function phraseCount(query: string, fields: string[]): number {
+		const phrases = uniqueTokens(query).map((token, i, all) =>
+			i < all.length - 1 ? `${token} ${all[i + 1]}` : '').filter(Boolean);
+		const normalizedFields = fields.map(normText);
+		return phrases.filter(phrase => normalizedFields.some(field => field.includes(phrase))).length;
+	}
+
+	function scoreFact(f: Fact, promptText: string, activeFacts: Fact[]): number {
+		const queryTokens = uniqueTokens(promptText);
+		if (!queryTokens.length) return f.confidence;
+		const frequencies = documentFrequency(activeFacts);
+		const keywordTokens = tokenSet(f.keywords.join(' '));
+		const pathTokens = pathTokenSet(f.sourceFiles.map(sf => sf.path));
+		const factTokens = tokenSet(f.fact);
+		const evidenceTokens = tokenSet(f.evidence);
+		let score = 0;
+		let signals = 0;
+		for (const token of queryTokens) {
+			const weight = rarity(token, activeFacts.length, frequencies);
+			if (keywordTokens.has(token)) { score += FACT_FIELD_WEIGHTS.keyword * weight; signals++; }
+			if (pathTokens.has(token)) { score += FACT_FIELD_WEIGHTS.path * weight; signals++; }
+			if (factTokens.has(token)) { score += FACT_FIELD_WEIGHTS.fact * weight; signals++; }
+			if (evidenceTokens.has(token)) { score += FACT_FIELD_WEIGHTS.evidence * weight; signals++; }
+		}
+		const exactPath = queryTokens.some(token => pathTokens.has(token));
+		const phrases = phraseCount(promptText, [f.fact, f.evidence, ...f.sourceFiles.map(sf => sf.path)]);
+		if (phrases) score += phrases * PHRASE_BONUS;
+		if (!signals || (score < FACT_MIN_SCORE && !exactPath && !phrases)) return 0;
+		return score * (0.75 + 0.25 * clamp(f.confidence, 0, 1));
+	}
+
+	function diverseFacts(ranked: Array<{f: Fact; s: number}>): Fact[] {
+		const selected: Array<{f: Fact; s: number}> = [];
+		for (const candidate of ranked) {
+			const candidateTokens = tokenSet(`${candidate.f.fact} ${candidate.f.evidence}`);
+			const duplicate = selected.some(item => {
+				const existing = tokenSet(`${item.f.fact} ${item.f.evidence}`);
+				const shared = [...candidateTokens].filter(token => existing.has(token)).length;
+				return shared / Math.max(1, Math.max(candidateTokens.size, existing.size)) >= 0.8;
+			});
+			if (!duplicate) selected.push(candidate);
+		}
+		return selected.slice(0, MAX_INJECT).map(item => item.f);
 	}
 
 	function formatFact(f: Fact, n: number): string {
@@ -351,12 +418,11 @@ export default function (cmd: ModApi): void {
 		const active = storeFacts.filter(f => f.status === 'active');
 		let pick: Fact[];
 		if (promptText.trim()) {
-			pick = active
-				.map(f => ({f, s: scoreFact(f, promptText)}))
+			const ranked = active
+				.map(f => ({f, s: scoreFact(f, promptText, active)}))
 				.filter(x => x.s > 0)
-				.sort((a, b) => b.s - a.s)
-				.slice(0, MAX_INJECT)
-				.map(x => x.f);
+				.sort((a, b) => b.s - a.s || b.f.confidence - a.f.confidence);
+			pick = diverseFacts(ranked);
 		} else {
 			// No typed prompt yet (automated turns, headless) — the best
 			// guess is the highest-confidence active facts.
@@ -366,6 +432,7 @@ export default function (cmd: ModApi): void {
 		}
 
 		if (!pick.length) {
+			injectedFacts = [];
 			injectedCache = {key, value: ''};
 			return undefined;
 		}
@@ -373,8 +440,34 @@ export default function (cmd: ModApi): void {
 			'[Project Brain — durable facts about this codebase]\n\n' +
 			pick.map((f, i) => formatFact(f, i + 1)).join('\n\n') +
 			'\n\n(Stored in .commandcode/project-brain.jsonl; code is the source of truth — verify against source if the files changed.)';
+		injectedFacts = pick;
 		injectedCache = {key, value};
 		return value;
+	}
+
+	// ── Injection announcement ────────────────────────────────────────
+
+	// Key identifying the current task: the latest typed prompt. New text
+	// (or a cleared prompt) re-arms the announce; the same prompt only
+	// announces once even though appendSystemPrompt fires per round.
+	function promptKey(): string {
+		return latestUserPrompt || '';
+	}
+
+	// Notify that facts were injected, and show the exact list in the feed
+	// so the user sees precisely what is being used this run.
+	function announceInjection(key: string): void {
+		if (announcedPromptKey === key) return;
+		announcedPromptKey = key;
+		if (!injectedFacts.length) return;
+		const n = injectedFacts.length;
+		const lines = injectedFacts.map((f, i) =>
+			`${i + 1}. ${f.fact}` +
+			(f.evidence ? `\n   Evidence: ${truncate(f.evidence, 180)}` : '') +
+			`\n   Sources: ${f.sourceFiles.map(s => s.path).join(', ')}` +
+			` · confidence ${f.confidence.toFixed(2)}`);
+		cmd.ui.notify(`${dim('brain')} ${bold(cyan(`${n} relevant fact${n === 1 ? '' : 's'} injected`))} — see feed entry for details.`);
+		cmd.showEntry('project-brain-injected', {title: 'Project Brain — facts used this run', lines});
 	}
 
 	// ── Discovery pass ─────────────────────────────────────────────────
@@ -431,6 +524,19 @@ export default function (cmd: ModApi): void {
 		);
 	}
 
+	// Relative date for list rows: "x mins ago" / "x hr ago" / "x days ago"
+	// within RELATIVE_DAYS, otherwise the full YYYY-MM-DD date.
+	function formatDate(iso: string): string {
+		const then = new Date(iso).getTime();
+		if (Number.isNaN(then)) return iso.slice(0, 10);
+		const mins = Math.round((Date.now() - then) / 60_000);
+		if (mins < 60) return `${Math.max(1, mins)} mins ago`;
+		const hrs = Math.round(mins / 60);
+		if (hrs < 24 * RELATIVE_DAYS) return `${hrs} hr${hrs === 1 ? '' : 's'} ago`;
+		const days = Math.round(hrs / 24);
+		return `${days} days ago`;
+	}
+
 	function listFactsMessage(): string {
 		if (!storeFacts.length) {
 			return '🧠 No facts stored yet — run /brain learn or let a working session discover some.';
@@ -440,7 +546,7 @@ export default function (cmd: ModApi): void {
 			const src = f.sourceFiles.map(s => s.path).join(', ');
 			return `${badge} ${f.fact}\n` +
 				`   ─ ${f.evidence}\n` +
-				`   📎 ${src} · conf ${f.confidence.toFixed(2)} · ${f.id} · ${f.createdAt.slice(0, 10)}`;
+				`   📎 ${src} · conf ${f.confidence.toFixed(2)} · ${f.id} · ${formatDate(f.createdAt)}`;
 		});
 		return `🧠 Project Brain — ${storeFacts.length} fact(s)\n\n${rows.join('\n\n')}`;
 	}
@@ -490,6 +596,7 @@ export default function (cmd: ModApi): void {
 			learningPending = false;
 			forceLearn = false;
 			everLearnedThisSession = false;
+			announcedPromptKey = null;
 			await ensureInit();
 			updateStatus();
 		},
@@ -519,7 +626,11 @@ export default function (cmd: ModApi): void {
 		 * and the block is cached (storeVersion + prompt text) so it stays
 		 * byte-stable across the rounds of one run.
 		 */
-		appendSystemPrompt: async () => buildInjectedBlock(),
+		appendSystemPrompt: async () => {
+			const block = await buildInjectedBlock();
+			if (block) announceInjection(promptKey());
+			return block;
+		},
 
 		/**
 		 * afterToolCall — activity tracking for the discovery prompt: which
@@ -568,10 +679,21 @@ export default function (cmd: ModApi): void {
 		onRunEnd: () => {
 			repoFilesSeen.clear();
 			lastCommands.length = 0;
+			announcedPromptKey = null;
+			injectedFacts = [];
 		},
 	});
 
 	// ── Slash command: /brain ──────────────────────────────────────────
+
+	// Renderer for the injection-announcement feed entry. First registration
+	// per type wins, so this stays ours.
+	cmd.addRenderer('project-brain-injected', data => {
+		const d = data as {title?: string; lines?: string[]};
+		const lines = [...(d.lines ?? [])];
+		if (d.title) lines.unshift(dim(cyan(d.title)));
+		return lines;
+	});
 
 	cmd.addCommand({
 		name: 'brain',

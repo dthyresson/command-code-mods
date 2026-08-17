@@ -357,11 +357,18 @@ brain re-hashes them and any fact whose code changed is retired as *stale*
 ### What it demonstrates
 
 - **`appendSystemPrompt` — turn-scoped context injection.** The heart of
-  the mod. Each round, the current prompt is scored against every fact
-  (keyword / fact-text / source-path overlap) and only relevant facts are
-  appended to the system prompt. Unrelated facts stay out. The block is
-  cached by store version + prompt text, so it stays byte-stable across
-  the rounds of one run — the provider's prompt-prefix cache isn't busted.
+  the mod. Each round, the current prompt is scored against every active fact
+  using exact normalized tokens, weighted keyword/fact/evidence/path fields,
+  rare-term weighting, phrase bonuses, a relevance threshold, and duplicate
+  suppression. Only relevant facts are appended to the system prompt. The
+  block is cached by store version + prompt text, so it stays byte-stable
+  across the rounds of one run — the provider's prompt-prefix cache isn't
+  busted.
+- **`cmd.addRenderer` + `cmd.showEntry` — visible memory.** When facts are
+  injected, the brain announces it: a 🧠 notify (`brain: 3 relevant facts
+  injected`) and a feed entry listing exactly which facts — with evidence,
+  sources, and confidence — are being used this run. The announce fires
+  once per task, not once per round.
 - **`onStop` with `{continue: true}` — a post-run discovery pass.** When a
   run that touched the repo would end, the brain injects one extra turn
   asking the model to propose durable facts as JSON — the same force-
@@ -443,8 +450,9 @@ Cross-session episodic memory: "What happened before?" Session history
 and compaction tell you what *this* session did; Task Journal remembers
 what *past* sessions did. After a *meaningful* run — one that changed
 files or ran tests, not mere read-only exploration — it saves a
-compressed episode — task, outcome, approaches tried, failures, solution,
-tests, lesson — as JSON lines in `.commandcode/task-journal.jsonl`
+compressed episode — task, outcome, approaches tried, decisions made,
+failures, solution, tests, lesson — as JSON lines in
+`.commandcode/task-journal.jsonl`
 (tracked in git, created on first write). At the start of the next similar task it
 retrieves the top few episodes and injects them into the system prompt,
 so a future agent can answer "have we solved something resembling this
@@ -466,15 +474,23 @@ episode, not the transcript.
   is routed to a cheap model (`deepseek/deepseek-v4-flash` by default),
   keeping the main-loop model on real work.
 - **`appendSystemPrompt` — the retrieval half of the loop.** Prior
-  episodes scored as relevant to the current task (keyword / task-text /
-  path overlap) are injected as "Relevant previous experience" — with
-  the reminder that it is *historical, not current truth*. Old episodes
-  are discounted; episodes that proved useful before rank higher. The
-  block is cached by store version + task text so it stays byte-stable
-  across the rounds of one run.
+  episodes are ranked with exact normalized tokens, weighted task/summary/
+  solution/lesson/decision/approach/test/path fields, rare-term and phrase
+  bonuses, a relevance threshold, outcome quality, bounded feedback, gradual
+  freshness decay, and near-duplicate suppression. The same selector is used
+  by automatic injection, `/journal search`, and `task_journal_search`, so
+  every retrieval surface applies the same relevance policy. Selected episodes
+  are injected as "Relevant previous experience" — with the reminder that it
+  is *historical, not current truth*. The block is cached by store version +
+  latest prompt text so it stays byte-stable across the rounds of one run.
+- **`cmd.addRenderer` + `cmd.showEntry` — visible memory.** When episodes
+  are injected, the journal announces it: a 📓 notify (`journal: 2 episodes
+  injected`) and a feed entry listing exactly which episodes — task,
+  outcome, lesson, decisions — are being used this run. The announce
+  fires once per task, not once per round.
 - **`transformInput` — typed-input interception.** The journal *reads*
-  the user's prompt (passing it through unchanged) to know the current
-  task and to detect when a new task starts.
+  the user's latest prompt (passing it through unchanged) so retrieval follows
+  the task currently being solved.
 - **`afterToolCall` — activity + outcome tracking.** Records which files
   the run read or edited and which test commands ran (with verdicts) so
   the extraction prompt knows what to focus on — and sniffs the run's
@@ -489,7 +505,7 @@ episode, not the transcript.
   announces each newly stored episode ("📓 Journaled: …"); a persistent
   footer segment shows the episode count.
 - **`cmd.events` — cross-mod cooperation.** When an episode reveals a
-  durable repo fact (its lesson), the journal emits a
+  durable repo fact (its lesson or a key decision), the journal emits a
   `task-journal:durable-fact` event on the mod bus. project-brain listens
   and queues its discovery pass, so facts graduate into Project Brain —
   the journal holds episodes, the brain holds facts. The two mods
@@ -515,7 +531,7 @@ cmd --mod-option task-journal.extract=false
 ### Commands
 
 - `/journal` — list every stored episode with outcome, date, and id.
-- `/journal show <id>` — full detail: approaches, solution, tests, lesson.
+- `/journal show <id>` — full detail: approaches, decisions, solution, tests, lesson.
 - `/journal search <query>` — rank episodes against a task description.
 - `/journal forget <id>` — delete a specific episode.
 
@@ -528,19 +544,25 @@ cmd --mod-option task-journal.extract=false
    counts as meaningful only if it changed at least 2 files, or changed 1
    file and ran a test/check command — so read-only exploration (pure
    `read_file`/`glob`/`ls`) never triggers an extraction.
-2. **Retrieve.** Next task, `appendSystemPrompt` scores the current
-   prompt against every episode and injects only the top 2–4 as
-   "Relevant previous experience" — what was tried, what failed and why,
-   what worked, how it was verified, and the lesson.
-3. **Measure.** Every retrieved episode's `retrievalCount` is bumped when
-   surfaced; when the run's own test output turns green (or the model
-   calls `task_journal_feedback`), `successfulRetrievalCount` bumps too.
-   Episodes that helped rank higher next time — the raw training data
+2. **Retrieve.** Each latest prompt is scored against every episode using
+   exact normalized tokens, weighted experience fields, rare-term and
+   phrase/path bonuses, outcome quality, bounded feedback, freshness decay,
+   and a minimum relevance gate. The shared selector injects only diverse,
+   relevant episodes as "Relevant previous experience" — what was tried,
+   what failed and why, what was decided (and why), what worked, how it was
+   verified, and the lesson. `/journal search` and `task_journal_search` use
+   the same selector; exact normalized duplicate episodes are rejected at
+   ingestion.
+3. **Measure.** Every episode injected into the prompt or returned by
+   `task_journal_search` is attributed to the run and gets its
+   `retrievalCount` bumped; when the run's own test output turns green (or the
+   model calls `task_journal_feedback`), `successfulRetrievalCount` bumps
+   too. Episodes that helped rank higher next time — the raw training data
    for a future learned retrieval policy.
-4. **Graduate.** If an episode's lesson is a durable repo fact, the
-   journal emits a `task-journal:durable-fact` event; project-brain
-   picks it up and queues its discovery pass so the fact lives on in
-   the brain even after the episode goes stale.
+4. **Graduate.** If an episode's lesson (or a key decision) is a durable
+   repo fact, the journal emits a `task-journal:durable-fact` event;
+   project-brain picks it up and queues its discovery pass so the fact
+   lives on in the brain even after the episode goes stale.
 
 ### Requirements
 
